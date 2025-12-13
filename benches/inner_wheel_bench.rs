@@ -197,7 +197,7 @@ fn bench_timer_patterns(c: &mut Criterion) {
 fn bench_probing_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("probing_overhead");
 
-    // Best case: empty slot
+    // Best case: empty slot (no probing needed)
     group.bench_function("probe_0", |b| {
         let mut wheel: InnerWheel<u64> = InnerWheel::new(256, 4);
         let mut slot = 0usize;
@@ -212,7 +212,8 @@ fn bench_probing_overhead(c: &mut Criterion) {
 
     // Probe 1 slot (first slot full)
     group.bench_function("probe_1", |b| {
-        let mut wheel: InnerWheel<u64> = InnerWheel::new(256, 1);
+        // Need max_probes >= 2
+        let mut wheel: InnerWheel<u64> = InnerWheel::with_max_probes(256, 1, 2);
 
         // Fill even slots
         for slot in (0..256).step_by(2) {
@@ -230,26 +231,26 @@ fn bench_probing_overhead(c: &mut Criterion) {
         });
     });
 
-    // Probe 4 slots
-    group.bench_function("probe_4", |b| {
-        let mut wheel: InnerWheel<u64> = InnerWheel::new(256, 1);
+    // Probe 2 slots
+    group.bench_function("probe_2", |b| {
+        // Need max_probes >= 3
+        let mut wheel: InnerWheel<u64> = InnerWheel::with_max_probes(256, 1, 3);
 
-        // Fill slots 0-3, 8-11, 16-19, etc
-        for base in (0..256).step_by(8) {
-            for offset in 0..4 {
-                if base + offset < 256 {
-                    unsafe { wheel.insert(base + offset, 0).unwrap() };
-                }
+        // Fill slots 0,1, 4,5, 8,9, etc (pairs)
+        for base in (0..256).step_by(4) {
+            unsafe {
+                wheel.insert(base, 0).unwrap();
+                wheel.insert(base + 1, 0).unwrap();
             }
         }
 
         let mut slot = 0usize;
 
         b.iter(|| {
-            // Insert at base, probes 4 slots
+            // Insert at base, probes 2 slots to base+2
             let r = unsafe { wheel.insert(slot, 42) }.unwrap();
             unsafe { wheel.remove(r.slot, r.key) };
-            slot = (slot + 8) & 255;
+            slot = (slot + 4) & 255;
             black_box(r)
         });
     });
