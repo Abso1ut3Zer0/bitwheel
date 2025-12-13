@@ -1,2 +1,2 @@
-mod slot;
-mod wheel;
+pub mod slot;
+pub mod wheel;

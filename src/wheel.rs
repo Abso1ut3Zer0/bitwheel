@@ -145,10 +145,8 @@ impl<T> InnerWheel<T> {
         );
 
         // SAFETY: caller guarantees slot < num_slots
-        unsafe {
-            let s = self.slots.get_unchecked_mut(slot);
-            s.try_pop()
-        }
+        let s = unsafe { self.slots.get_unchecked_mut(slot) };
+        s.try_pop().map(|(_, value)| value)
     }
 
     /// Check if a slot is empty.

@@ -5,3 +5,10 @@ edition = "2024"
 
 [dependencies]
 thiserror = "2.0.17"
+
+[dev-dependencies]
+criterion = "0.8.1"
+
+[[bench]]
+name = "inner_wheel_bench"
+harness = false

@@ -1,14 +1,31 @@
 const NONE: usize = usize::MAX;
 
 enum Entry<T> {
-    Vacant { next: usize },
-    Occupied(T),
+    Vacant {
+        next_free: usize,
+    },
+    Occupied {
+        value: T,
+        next_occupied: usize,
+        prev_occupied: usize,
+    },
 }
 
 /// Fixed-size slab with unsafe API.
+///
+/// Single allocation with intrusive free list and occupied list.
+/// Occupied list enables O(1) pop.
+///
+/// # Safety
+///
+/// This is a low-level primitive. Callers must ensure:
+/// - `insert` is not called when full
+/// - `remove` is only called with valid, occupied keys
+/// - `key < capacity` for all key-based operations
 pub struct Slot<T> {
     entries: Box<[Entry<T>]>,
     free_head: usize,
+    occupied_head: usize,
     len: usize,
     capacity: usize,
 }
@@ -17,7 +34,7 @@ impl<T> Slot<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         let entries = (0..capacity)
             .map(|i| Entry::Vacant {
-                next: if i + 1 < capacity { i + 1 } else { NONE },
+                next_free: if i + 1 < capacity { i + 1 } else { NONE },
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -25,6 +42,7 @@ impl<T> Slot<T> {
         Self {
             entries,
             free_head: if capacity > 0 { 0 } else { NONE },
+            occupied_head: NONE,
             len: 0,
             capacity,
         }
@@ -34,18 +52,43 @@ impl<T> Slot<T> {
     ///
     /// # Safety
     /// Caller must ensure slot is not full.
-    #[inline(always)]
+    #[inline]
     pub unsafe fn insert(&mut self, value: T) -> usize {
         let key = self.free_head;
-        let entry = unsafe { self.entries.get_unchecked_mut(key) };
 
-        let Entry::Vacant { next } = entry else {
-            unsafe { core::hint::unreachable_unchecked() }
+        // SAFETY: caller guarantees not full, so free_head is valid
+        let next_free = {
+            let entry = unsafe { self.entries.get_unchecked(key) };
+            match entry {
+                Entry::Vacant { next_free } => *next_free,
+                Entry::Occupied { .. } => unsafe { core::hint::unreachable_unchecked() },
+            }
         };
 
-        self.free_head = *next;
-        *entry = Entry::Occupied(value);
+        self.free_head = next_free;
+
+        // Update old head's prev pointer if it exists
+        let old_head = self.occupied_head;
+        if old_head != NONE {
+            // SAFETY: occupied_head is valid when != NONE
+            let old_head_entry = unsafe { self.entries.get_unchecked_mut(old_head) };
+            match old_head_entry {
+                Entry::Occupied { prev_occupied, .. } => *prev_occupied = key,
+                Entry::Vacant { .. } => unsafe { core::hint::unreachable_unchecked() },
+            }
+        }
+
+        // SAFETY: key is valid (was free_head)
+        let entry = unsafe { self.entries.get_unchecked_mut(key) };
+        *entry = Entry::Occupied {
+            value,
+            next_occupied: old_head,
+            prev_occupied: NONE,
+        };
+
+        self.occupied_head = key;
         self.len += 1;
+
         key
     }
 
@@ -53,25 +96,65 @@ impl<T> Slot<T> {
     ///
     /// # Safety
     /// Caller must ensure key < capacity and entry is occupied.
-    #[inline(always)]
+    #[inline]
     pub unsafe fn remove(&mut self, key: usize) -> T {
-        let entry = unsafe { self.entries.get_unchecked_mut(key) };
-
-        let Entry::Occupied(_) = entry else {
-            unsafe { core::hint::unreachable_unchecked() }
+        // First, read the prev/next indices
+        // SAFETY: caller guarantees key < capacity and occupied
+        let (next_occupied, prev_occupied) = {
+            let entry = unsafe { self.entries.get_unchecked(key) };
+            match entry {
+                Entry::Occupied {
+                    next_occupied,
+                    prev_occupied,
+                    ..
+                } => (*next_occupied, *prev_occupied),
+                Entry::Vacant { .. } => unsafe { core::hint::unreachable_unchecked() },
+            }
         };
 
+        // Unlink from occupied list - update prev's next pointer
+        if prev_occupied != NONE {
+            // SAFETY: prev_occupied is valid when != NONE
+            let prev_entry = unsafe { self.entries.get_unchecked_mut(prev_occupied) };
+            match prev_entry {
+                Entry::Occupied {
+                    next_occupied: prev_next,
+                    ..
+                } => *prev_next = next_occupied,
+                Entry::Vacant { .. } => unsafe { core::hint::unreachable_unchecked() },
+            }
+        } else {
+            // Was head
+            self.occupied_head = next_occupied;
+        }
+
+        // Unlink from occupied list - update next's prev pointer
+        if next_occupied != NONE {
+            // SAFETY: next_occupied is valid when != NONE
+            let next_entry = unsafe { self.entries.get_unchecked_mut(next_occupied) };
+            match next_entry {
+                Entry::Occupied {
+                    prev_occupied: next_prev,
+                    ..
+                } => *next_prev = prev_occupied,
+                Entry::Vacant { .. } => unsafe { core::hint::unreachable_unchecked() },
+            }
+        }
+
+        // Take value and link into free list
+        // SAFETY: key is valid
+        let entry = unsafe { self.entries.get_unchecked_mut(key) };
         let old = std::mem::replace(
             entry,
             Entry::Vacant {
-                next: self.free_head,
+                next_free: self.free_head,
             },
         );
         self.free_head = key;
         self.len -= 1;
 
         match old {
-            Entry::Occupied(value) => value,
+            Entry::Occupied { value, .. } => value,
             Entry::Vacant { .. } => unsafe { core::hint::unreachable_unchecked() },
         }
     }
@@ -80,24 +163,17 @@ impl<T> Slot<T> {
     ///
     /// # Safety
     /// Caller must ensure key < capacity.
-    #[inline(always)]
+    #[inline]
     pub unsafe fn try_remove(&mut self, key: usize) -> Option<T> {
-        let entry = unsafe { self.entries.get_unchecked_mut(key) };
+        // SAFETY: caller guarantees key < capacity
+        let is_occupied = {
+            let entry = unsafe { self.entries.get_unchecked(key) };
+            matches!(entry, Entry::Occupied { .. })
+        };
 
-        if let Entry::Occupied(_) = entry {
-            let old = std::mem::replace(
-                entry,
-                Entry::Vacant {
-                    next: self.free_head,
-                },
-            );
-            self.free_head = key;
-            self.len -= 1;
-
-            match old {
-                Entry::Occupied(value) => Some(value),
-                Entry::Vacant { .. } => unsafe { core::hint::unreachable_unchecked() },
-            }
+        if is_occupied {
+            // SAFETY: we just verified it's occupied
+            Some(unsafe { self.remove(key) })
         } else {
             None
         }
@@ -107,57 +183,43 @@ impl<T> Slot<T> {
     ///
     /// # Safety
     /// Caller must ensure key < capacity.
-    #[inline(always)]
+    #[inline]
     pub unsafe fn is_occupied(&self, key: usize) -> bool {
-        matches!(
-            unsafe { self.entries.get_unchecked(key) },
-            Entry::Occupied(_)
-        )
+        // SAFETY: caller guarantees key < capacity
+        let entry = unsafe { self.entries.get_unchecked(key) };
+        matches!(entry, Entry::Occupied { .. })
     }
 
-    /// Try to pop any occupied entry.
-    #[inline(always)]
-    pub fn try_pop(&mut self) -> Option<T> {
-        for i in 0..self.capacity {
-            // SAFETY: i < capacity
-            let entry = unsafe { self.entries.get_unchecked_mut(i) };
-
-            if let Entry::Occupied(_) = entry {
-                let old = std::mem::replace(
-                    entry,
-                    Entry::Vacant {
-                        next: self.free_head,
-                    },
-                );
-                self.free_head = i;
-                self.len -= 1;
-
-                return match old {
-                    Entry::Occupied(value) => Some(value),
-                    // SAFETY: we just checked it's occupied
-                    Entry::Vacant { .. } => unsafe { core::hint::unreachable_unchecked() },
-                };
-            }
+    /// Pop any occupied entry. O(1).
+    /// Returns (key, value) so caller knows which key was popped.
+    #[inline]
+    pub fn try_pop(&mut self) -> Option<(usize, T)> {
+        if self.occupied_head == NONE {
+            return None;
         }
-        None
+
+        let key = self.occupied_head;
+        // SAFETY: occupied_head != NONE means it's valid and occupied
+        let value = unsafe { self.remove(key) };
+        Some((key, value))
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn is_full(&self) -> bool {
         self.len >= self.capacity
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -202,7 +264,6 @@ mod tests {
         let k2 = unsafe { slot.insert(30) };
         let k3 = unsafe { slot.insert(40) };
 
-        // Keys should be sequential on fresh slot
         assert_eq!(k0, 0);
         assert_eq!(k1, 1);
         assert_eq!(k2, 2);
@@ -231,7 +292,6 @@ mod tests {
         let k1 = unsafe { slot.insert(20) };
         let k2 = unsafe { slot.insert(30) };
 
-        // Remove in insertion order
         assert_eq!(unsafe { slot.remove(k0) }, 10);
         assert_eq!(unsafe { slot.remove(k1) }, 20);
         assert_eq!(unsafe { slot.remove(k2) }, 30);
@@ -246,7 +306,6 @@ mod tests {
         let k1 = unsafe { slot.insert(20) };
         let k2 = unsafe { slot.insert(30) };
 
-        // Remove in reverse order
         assert_eq!(unsafe { slot.remove(k2) }, 30);
         assert_eq!(unsafe { slot.remove(k1) }, 20);
         assert_eq!(unsafe { slot.remove(k0) }, 10);
@@ -261,11 +320,9 @@ mod tests {
         let k1 = unsafe { slot.insert(20) };
         let k2 = unsafe { slot.insert(30) };
 
-        // Remove from middle
         assert_eq!(unsafe { slot.remove(k1) }, 20);
         assert_eq!(slot.len(), 2);
 
-        // Others still accessible
         assert_eq!(unsafe { slot.remove(k0) }, 10);
         assert_eq!(unsafe { slot.remove(k2) }, 30);
     }
@@ -279,7 +336,6 @@ mod tests {
         let k0 = unsafe { slot.insert(10) };
         unsafe { slot.remove(k0) };
 
-        // Should reuse key 0
         let k1 = unsafe { slot.insert(20) };
         assert_eq!(k1, k0);
     }
@@ -292,19 +348,18 @@ mod tests {
         let k1 = unsafe { slot.insert(20) };
         let k2 = unsafe { slot.insert(30) };
 
-        // Remove in order: 0, 1, 2
         unsafe {
             slot.remove(k0);
             slot.remove(k1);
             slot.remove(k2);
         }
 
-        // Free list is LIFO, so reinsert should give: 2, 1, 0
+        // Free list is LIFO: k2 -> k1 -> k0
         let new_k0 = unsafe { slot.insert(100) };
         let new_k1 = unsafe { slot.insert(200) };
         let new_k2 = unsafe { slot.insert(300) };
 
-        assert_eq!(new_k0, k2); // 2 was last freed
+        assert_eq!(new_k0, k2);
         assert_eq!(new_k1, k1);
         assert_eq!(new_k2, k0);
     }
@@ -313,26 +368,20 @@ mod tests {
     fn test_free_list_interleaved() {
         let mut slot: Slot<u32> = Slot::with_capacity(4);
 
-        // Insert 3
         let k0 = unsafe { slot.insert(10) };
         let k1 = unsafe { slot.insert(20) };
         let k2 = unsafe { slot.insert(30) };
 
-        // Remove middle
         unsafe { slot.remove(k1) };
 
-        // Insert should reuse k1
         let k3 = unsafe { slot.insert(40) };
         assert_eq!(k3, k1);
 
-        // Remove first
         unsafe { slot.remove(k0) };
 
-        // Insert should reuse k0
         let k4 = unsafe { slot.insert(50) };
         assert_eq!(k4, k0);
 
-        // Verify values
         assert_eq!(unsafe { slot.remove(k0) }, 50);
         assert_eq!(unsafe { slot.remove(k1) }, 40);
         assert_eq!(unsafe { slot.remove(k2) }, 30);
@@ -342,19 +391,16 @@ mod tests {
     fn test_fill_empty_refill() {
         let mut slot: Slot<u32> = Slot::with_capacity(4);
 
-        // Fill completely
         for i in 0..4 {
             unsafe { slot.insert(i as u32) };
         }
         assert!(slot.is_full());
 
-        // Empty completely
         for i in 0..4 {
             unsafe { slot.try_remove(i) };
         }
         assert!(slot.is_empty());
 
-        // Refill completely
         for i in 0..4 {
             unsafe { slot.insert((i + 100) as u32) };
         }
@@ -382,7 +428,6 @@ mod tests {
         let key = unsafe { slot.insert(42) };
         unsafe { slot.remove(key) };
 
-        // Second try_remove should return None
         let result = unsafe { slot.try_remove(key) };
         assert_eq!(result, None);
     }
@@ -391,9 +436,8 @@ mod tests {
     fn test_try_remove_never_occupied() {
         let mut slot: Slot<u32> = Slot::with_capacity(4);
 
-        // Key 2 was never occupied
-        unsafe { slot.insert(10) }; // key 0
-        unsafe { slot.insert(20) }; // key 1
+        unsafe { slot.insert(10) };
+        unsafe { slot.insert(20) };
 
         let result = unsafe { slot.try_remove(2) };
         assert_eq!(result, None);
@@ -418,7 +462,6 @@ mod tests {
     fn test_is_occupied_fresh() {
         let slot: Slot<u32> = Slot::with_capacity(4);
 
-        // All vacant initially
         for i in 0..4 {
             assert!(!unsafe { slot.is_occupied(i) });
         }
@@ -459,9 +502,10 @@ mod tests {
     fn test_try_pop_single() {
         let mut slot: Slot<u32> = Slot::with_capacity(4);
 
-        unsafe { slot.insert(42) };
+        let key = unsafe { slot.insert(42) };
 
-        assert_eq!(slot.try_pop(), Some(42));
+        let result = slot.try_pop();
+        assert_eq!(result, Some((key, 42)));
         assert!(slot.is_empty());
     }
 
@@ -476,7 +520,7 @@ mod tests {
         }
 
         let mut values = vec![];
-        while let Some(v) = slot.try_pop() {
+        while let Some((_, v)) = slot.try_pop() {
             values.push(v);
         }
 
@@ -488,6 +532,23 @@ mod tests {
     }
 
     #[test]
+    fn test_try_pop_returns_lifo() {
+        let mut slot: Slot<u32> = Slot::with_capacity(4);
+
+        unsafe {
+            slot.insert(10);
+            slot.insert(20);
+            slot.insert(30);
+        }
+
+        // Occupied list is LIFO, so pop should return in reverse order
+        assert_eq!(slot.try_pop(), Some((2, 30)));
+        assert_eq!(slot.try_pop(), Some((1, 20)));
+        assert_eq!(slot.try_pop(), Some((0, 10)));
+        assert_eq!(slot.try_pop(), None);
+    }
+
+    #[test]
     fn test_try_pop_with_gaps() {
         let mut slot: Slot<u32> = Slot::with_capacity(4);
 
@@ -495,14 +556,13 @@ mod tests {
         let _k1 = unsafe { slot.insert(20) };
         let k2 = unsafe { slot.insert(30) };
 
-        // Create gaps
         unsafe {
             slot.remove(k0);
             slot.remove(k2);
         }
 
-        // Only 20 should remain
-        assert_eq!(slot.try_pop(), Some(20));
+        let result = slot.try_pop();
+        assert_eq!(result, Some((1, 20)));
         assert_eq!(slot.try_pop(), None);
     }
 
@@ -518,9 +578,111 @@ mod tests {
         slot.try_pop();
         assert_eq!(slot.len(), 1);
 
-        // Should be able to insert again
         unsafe { slot.insert(30) };
         assert_eq!(slot.len(), 2);
+    }
+
+    // ==================== Occupied List Integrity ====================
+
+    #[test]
+    fn test_occupied_list_single_element() {
+        let mut slot: Slot<u32> = Slot::with_capacity(4);
+
+        let k = unsafe { slot.insert(42) };
+
+        let v = unsafe { slot.remove(k) };
+        assert_eq!(v, 42);
+
+        assert_eq!(slot.try_pop(), None);
+    }
+
+    #[test]
+    fn test_occupied_list_remove_head() {
+        let mut slot: Slot<u32> = Slot::with_capacity(4);
+
+        let _k0 = unsafe { slot.insert(10) };
+        let _k1 = unsafe { slot.insert(20) };
+        let k2 = unsafe { slot.insert(30) }; // This is the head
+
+        unsafe { slot.remove(k2) };
+
+        let mut values = vec![];
+        while let Some((_, v)) = slot.try_pop() {
+            values.push(v);
+        }
+        assert_eq!(values.len(), 2);
+        assert!(values.contains(&10));
+        assert!(values.contains(&20));
+    }
+
+    #[test]
+    fn test_occupied_list_remove_tail() {
+        let mut slot: Slot<u32> = Slot::with_capacity(4);
+
+        let k0 = unsafe { slot.insert(10) }; // This is the tail
+        let _k1 = unsafe { slot.insert(20) };
+        let _k2 = unsafe { slot.insert(30) };
+
+        unsafe { slot.remove(k0) };
+
+        let mut values = vec![];
+        while let Some((_, v)) = slot.try_pop() {
+            values.push(v);
+        }
+        assert_eq!(values.len(), 2);
+        assert!(values.contains(&20));
+        assert!(values.contains(&30));
+    }
+
+    #[test]
+    fn test_occupied_list_remove_middle() {
+        let mut slot: Slot<u32> = Slot::with_capacity(4);
+
+        let _k0 = unsafe { slot.insert(10) };
+        let k1 = unsafe { slot.insert(20) }; // Middle
+        let _k2 = unsafe { slot.insert(30) };
+
+        unsafe { slot.remove(k1) };
+
+        let mut values = vec![];
+        while let Some((_, v)) = slot.try_pop() {
+            values.push(v);
+        }
+        assert_eq!(values.len(), 2);
+        assert!(values.contains(&10));
+        assert!(values.contains(&30));
+    }
+
+    #[test]
+    fn test_occupied_list_complex_operations() {
+        let mut slot: Slot<u32> = Slot::with_capacity(8);
+
+        let k0 = unsafe { slot.insert(10) };
+        let k1 = unsafe { slot.insert(20) };
+        let k2 = unsafe { slot.insert(30) };
+        let k3 = unsafe { slot.insert(40) };
+        let k4 = unsafe { slot.insert(50) };
+
+        unsafe {
+            slot.remove(k1);
+            slot.remove(k3);
+        }
+
+        let _k5 = unsafe { slot.insert(60) };
+        let _k6 = unsafe { slot.insert(70) };
+
+        unsafe { slot.remove(k2) };
+
+        let mut remaining: Vec<u32> = vec![];
+        while let Some((_, v)) = slot.try_pop() {
+            remaining.push(v);
+        }
+
+        assert_eq!(remaining.len(), 4);
+        assert!(remaining.contains(&10)); // k0
+        assert!(remaining.contains(&50)); // k4
+        assert!(remaining.contains(&60)); // k5
+        assert!(remaining.contains(&70)); // k6
     }
 
     // ==================== Capacity Edge Cases ====================
@@ -530,7 +692,7 @@ mod tests {
         let slot: Slot<u32> = Slot::with_capacity(0);
 
         assert!(slot.is_empty());
-        assert!(slot.is_full()); // len >= capacity (0 >= 0)
+        assert!(slot.is_full());
         assert_eq!(slot.capacity(), 0);
         assert_eq!(slot.len(), 0);
     }
@@ -628,7 +790,6 @@ mod tests {
             assert_eq!(drop_count.get(), 0);
         }
 
-        // All 3 should be dropped
         assert_eq!(drop_count.get(), 3);
     }
 
@@ -650,17 +811,14 @@ mod tests {
             unsafe { slot.insert(DropCounter(Rc::clone(&drop_count))) };
             let k2 = unsafe { slot.insert(DropCounter(Rc::clone(&drop_count))) };
 
-            // Remove two, leaving one occupied
             unsafe {
                 slot.remove(k0);
                 slot.remove(k2);
             }
 
-            // 2 dropped from remove
             assert_eq!(drop_count.get(), 2);
         }
 
-        // 1 more dropped when slot drops
         assert_eq!(drop_count.get(), 3);
     }
 
@@ -684,7 +842,6 @@ mod tests {
             assert_eq!(drop_count.get(), 1);
         }
 
-        // No additional drops - slot was empty
         assert_eq!(drop_count.get(), 1);
     }
 
@@ -695,16 +852,12 @@ mod tests {
         let mut slot: Slot<u32> = Slot::with_capacity(8);
 
         for round in 0..100 {
-            // Fill
             for i in 0..8 {
                 unsafe { slot.insert(round * 8 + i) };
             }
             assert!(slot.is_full());
 
-            // Drain
-            for _ in 0..8 {
-                slot.try_pop();
-            }
+            while slot.try_pop().is_some() {}
             assert!(slot.is_empty());
         }
     }
@@ -727,35 +880,31 @@ mod tests {
         let mut slot: Slot<u32> = Slot::with_capacity(8);
         let mut keys = Vec::new();
 
-        // Insert 5
         for i in 0..5 {
             keys.push(unsafe { slot.insert(i) });
         }
 
-        // Remove 2
         unsafe {
             slot.remove(keys[1]);
             slot.remove(keys[3]);
         }
 
-        // Insert 3 more
         for i in 10..13 {
             keys.push(unsafe { slot.insert(i) });
         }
 
         assert_eq!(slot.len(), 6);
 
-        // Drain all
         let mut values = vec![];
-        while let Some(v) = slot.try_pop() {
+        while let Some((_, v)) = slot.try_pop() {
             values.push(v);
         }
 
         assert_eq!(values.len(), 6);
         assert!(values.contains(&0));
-        assert!(!values.contains(&1)); // was removed
+        assert!(!values.contains(&1));
         assert!(values.contains(&2));
-        assert!(!values.contains(&3)); // was removed
+        assert!(!values.contains(&3));
         assert!(values.contains(&4));
         assert!(values.contains(&10));
         assert!(values.contains(&11));
@@ -766,26 +915,59 @@ mod tests {
     fn test_key_stability() {
         let mut slot: Slot<u32> = Slot::with_capacity(4);
 
-        // Insert values
         let k0 = unsafe { slot.insert(100) };
         let k1 = unsafe { slot.insert(200) };
         let k2 = unsafe { slot.insert(300) };
 
-        // Keys should remain valid until removed
         assert!(unsafe { slot.is_occupied(k0) });
         assert!(unsafe { slot.is_occupied(k1) });
         assert!(unsafe { slot.is_occupied(k2) });
 
-        // Remove middle
         unsafe { slot.remove(k1) };
 
-        // k0 and k2 still valid
         assert!(unsafe { slot.is_occupied(k0) });
         assert!(!unsafe { slot.is_occupied(k1) });
         assert!(unsafe { slot.is_occupied(k2) });
 
-        // Can still remove by original keys
         assert_eq!(unsafe { slot.remove(k0) }, 100);
         assert_eq!(unsafe { slot.remove(k2) }, 300);
+    }
+
+    // ==================== Large Capacity Tests ====================
+
+    #[test]
+    fn test_large_capacity_pop_performance() {
+        let mut slot: Slot<u32> = Slot::with_capacity(1024);
+
+        for i in 0..10 {
+            unsafe { slot.insert(i) };
+        }
+
+        for _ in 0..10 {
+            assert!(slot.try_pop().is_some());
+        }
+        assert!(slot.try_pop().is_none());
+    }
+
+    #[test]
+    fn test_large_capacity_sparse() {
+        let mut slot: Slot<u32> = Slot::with_capacity(1024);
+
+        let mut keys = Vec::new();
+        for i in 0..100 {
+            keys.push(unsafe { slot.insert(i) });
+        }
+
+        for k in keys.iter().take(90) {
+            unsafe { slot.remove(*k) };
+        }
+
+        assert_eq!(slot.len(), 10);
+
+        let mut count = 0;
+        while slot.try_pop().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 10);
     }
 }
