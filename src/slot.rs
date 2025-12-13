@@ -34,7 +34,7 @@ impl<T> Slot<T> {
     ///
     /// # Safety
     /// Caller must ensure slot is not full.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn insert(&mut self, value: T) -> usize {
         let key = self.free_head;
         let entry = unsafe { self.entries.get_unchecked_mut(key) };
@@ -53,7 +53,7 @@ impl<T> Slot<T> {
     ///
     /// # Safety
     /// Caller must ensure key < capacity and entry is occupied.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn remove(&mut self, key: usize) -> T {
         let entry = unsafe { self.entries.get_unchecked_mut(key) };
 
@@ -80,7 +80,7 @@ impl<T> Slot<T> {
     ///
     /// # Safety
     /// Caller must ensure key < capacity.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn try_remove(&mut self, key: usize) -> Option<T> {
         let entry = unsafe { self.entries.get_unchecked_mut(key) };
 
@@ -107,7 +107,7 @@ impl<T> Slot<T> {
     ///
     /// # Safety
     /// Caller must ensure key < capacity.
-    #[inline]
+    #[inline(always)]
     pub unsafe fn is_occupied(&self, key: usize) -> bool {
         matches!(
             unsafe { self.entries.get_unchecked(key) },
@@ -116,7 +116,7 @@ impl<T> Slot<T> {
     }
 
     /// Try to pop any occupied entry.
-    #[inline]
+    #[inline(always)]
     pub fn try_pop(&mut self) -> Option<T> {
         for i in 0..self.capacity {
             // SAFETY: i < capacity
@@ -142,22 +142,22 @@ impl<T> Slot<T> {
         None
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn is_full(&self) -> bool {
         self.len >= self.capacity
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
