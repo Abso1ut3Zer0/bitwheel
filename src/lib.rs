@@ -1,2 +1,2 @@
-mod slab;
+mod slot;
 mod wheel;
