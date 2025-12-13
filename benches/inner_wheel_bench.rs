@@ -67,7 +67,7 @@ fn bench_single_insert(c: &mut Criterion) {
 
     // Measure single try_remove (miss)
     group.bench_function("try_remove_miss", |b| {
-        let wheel: InnerWheel<u64> = InnerWheel::new(256, 4);
+        let mut wheel: InnerWheel<u64> = InnerWheel::new(256, 4);
         let mut slot = 0usize;
         let mut key = 0usize;
 
@@ -96,7 +96,7 @@ fn bench_single_insert(c: &mut Criterion) {
 
     // Measure single pop_slot (empty)
     group.bench_function("pop_slot_miss", |b| {
-        let wheel: InnerWheel<u64> = InnerWheel::new(256, 4);
+        let mut wheel: InnerWheel<u64> = InnerWheel::new(256, 4);
         let mut slot = 0usize;
 
         b.iter(|| {
@@ -154,7 +154,7 @@ fn bench_timer_patterns(c: &mut Criterion) {
 
         b.iter(|| {
             // Pop current slot's timer
-            if let Some((_, v)) = unsafe { wheel.pop_slot(slot) } {
+            if let Some(v) = unsafe { wheel.pop_slot(slot) } {
                 // Reinsert (simulating periodic timer)
                 unsafe { wheel.insert(slot, v).unwrap() };
             }

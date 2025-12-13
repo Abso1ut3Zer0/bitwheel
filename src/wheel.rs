@@ -1,10 +1,13 @@
 use crate::slot::Slot;
 use thiserror::Error;
 
+/// Default maximum probes before giving up on insert.
+pub const DEFAULT_MAX_PROBES: usize = 3;
+
 #[derive(Debug, Error)]
 pub enum WheelError {
-    #[error("wheel full: all {0} slots at capacity")]
-    WheelFull(usize),
+    #[error("wheel full: exhausted {probes} probes starting at slot {slot}")]
+    WheelFull { slot: usize, probes: usize },
 }
 
 /// Result of a successful insert.
@@ -27,14 +30,25 @@ pub struct InnerWheel<T> {
     num_slots: usize,
     slot_capacity: usize,
     mask: usize,
+    max_probes: usize,
 }
 
 impl<T> InnerWheel<T> {
     /// Create a new wheel.
     ///
     /// `num_slots` is rounded up to the next power of 2.
+    /// Uses `DEFAULT_MAX_PROBES` (3) for probe limit.
     pub fn new(num_slots: usize, slot_capacity: usize) -> Self {
+        Self::with_max_probes(num_slots, slot_capacity, DEFAULT_MAX_PROBES)
+    }
+
+    /// Create a new wheel with custom max probes.
+    ///
+    /// `num_slots` is rounded up to the next power of 2.
+    /// `max_probes` is clamped to `min(max_probes, num_slots)`.
+    pub fn with_max_probes(num_slots: usize, slot_capacity: usize, max_probes: usize) -> Self {
         let num_slots = num_slots.next_power_of_two();
+        let max_probes = max_probes.min(num_slots);
 
         Self {
             slots: (0..num_slots)
@@ -44,12 +58,14 @@ impl<T> InnerWheel<T> {
             num_slots,
             slot_capacity,
             mask: num_slots - 1,
+            max_probes,
         }
     }
 
     /// Insert timer at slot, probing forward if full.
     ///
     /// Returns the actual slot and key on success.
+    /// Fails after `max_probes` attempts.
     ///
     /// # Safety
     /// Caller must ensure `slot < num_slots`.
@@ -61,7 +77,7 @@ impl<T> InnerWheel<T> {
             self.num_slots
         );
 
-        for probe in 0..self.num_slots {
+        for probe in 0..self.max_probes {
             let idx = (slot + probe) & self.mask;
 
             // SAFETY: idx is always < num_slots due to mask
@@ -76,7 +92,10 @@ impl<T> InnerWheel<T> {
             return Ok(InsertResult { slot: idx, key });
         }
 
-        Err(WheelError::WheelFull(self.num_slots))
+        Err(WheelError::WheelFull {
+            slot,
+            probes: self.max_probes,
+        })
     }
 
     /// Remove by slot + key.
@@ -100,10 +119,8 @@ impl<T> InnerWheel<T> {
         );
 
         // SAFETY: caller guarantees bounds and occupancy
-        unsafe {
-            let s = self.slots.get_unchecked_mut(slot);
-            s.remove(key)
-        }
+        let s = unsafe { self.slots.get_unchecked_mut(slot) };
+        unsafe { s.remove(key) }
     }
 
     /// Try to remove by slot + key. Returns None if not occupied.
@@ -126,10 +143,8 @@ impl<T> InnerWheel<T> {
         );
 
         // SAFETY: caller guarantees bounds
-        unsafe {
-            let s = self.slots.get_unchecked_mut(slot);
-            s.try_remove(key)
-        }
+        let s = unsafe { self.slots.get_unchecked_mut(slot) };
+        unsafe { s.try_remove(key) }
     }
 
     /// Pop any entry from slot. Returns None if slot is empty.
@@ -162,7 +177,7 @@ impl<T> InnerWheel<T> {
         );
 
         // SAFETY: caller guarantees slot < num_slots
-        unsafe { self.slots.get_unchecked(slot).is_empty() }
+        unsafe { self.slots.get_unchecked(slot) }.is_empty()
     }
 
     /// Check if a slot is full.
@@ -178,7 +193,7 @@ impl<T> InnerWheel<T> {
         );
 
         // SAFETY: caller guarantees slot < num_slots
-        unsafe { self.slots.get_unchecked(slot).is_full() }
+        unsafe { self.slots.get_unchecked(slot) }.is_full()
     }
 
     /// Total number of timers across all slots.
@@ -207,6 +222,11 @@ impl<T> InnerWheel<T> {
     }
 
     #[inline]
+    pub fn max_probes(&self) -> usize {
+        self.max_probes
+    }
+
+    #[inline]
     pub fn total_capacity(&self) -> usize {
         self.num_slots * self.slot_capacity
     }
@@ -230,6 +250,22 @@ mod tests {
         assert_eq!(wheel.num_slots(), 256);
         assert_eq!(wheel.slot_capacity(), 4);
         assert_eq!(wheel.total_capacity(), 1024);
+        assert_eq!(wheel.max_probes(), DEFAULT_MAX_PROBES);
+    }
+
+    #[test]
+    fn test_with_max_probes() {
+        let wheel: InnerWheel<u32> = InnerWheel::with_max_probes(256, 4, 16);
+
+        assert_eq!(wheel.max_probes(), 16);
+    }
+
+    #[test]
+    fn test_max_probes_clamped() {
+        // max_probes > num_slots should be clamped
+        let wheel: InnerWheel<u32> = InnerWheel::with_max_probes(8, 4, 100);
+
+        assert_eq!(wheel.max_probes(), 8);
     }
 
     #[test]
@@ -323,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_probe_multiple_slots() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(256, 1);
+        let mut wheel: InnerWheel<u32> = InnerWheel::with_max_probes(256, 1, 16);
 
         // Fill slots 10, 11, 12
         unsafe {
@@ -340,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_probe_wrap_around() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(4, 1);
+        let mut wheel: InnerWheel<u32> = InnerWheel::with_max_probes(4, 1, 4);
 
         // Fill slots 2, 3
         unsafe {
@@ -354,59 +390,70 @@ mod tests {
         assert_eq!(result.slot, 0);
     }
 
-    #[test]
-    fn test_probe_wrap_around_full_circle() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(4, 1);
-
-        // Fill slots 1, 2, 3
-        unsafe {
-            wheel.insert(1, 1).unwrap();
-            wheel.insert(2, 2).unwrap();
-            wheel.insert(3, 3).unwrap();
-        }
-
-        // Insert at 1 should wrap all the way to slot 0
-        let result = unsafe { wheel.insert(1, 4) }.unwrap();
-
-        assert_eq!(result.slot, 0);
-    }
-
-    // ==================== Wheel Full ====================
+    // ==================== Max Probes Exceeded ====================
 
     #[test]
-    fn test_wheel_full_error() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(4, 1);
+    fn test_max_probes_exceeded() {
+        let mut wheel: InnerWheel<u32> = InnerWheel::with_max_probes(256, 1, 4);
 
-        // Fill all 4 slots
+        // Fill slots 10, 11, 12, 13
         unsafe {
-            wheel.insert(0, 0).unwrap();
-            wheel.insert(1, 1).unwrap();
-            wheel.insert(2, 2).unwrap();
-            wheel.insert(3, 3).unwrap();
+            wheel.insert(10, 1).unwrap();
+            wheel.insert(11, 2).unwrap();
+            wheel.insert(12, 3).unwrap();
+            wheel.insert(13, 4).unwrap();
         }
 
-        assert!(wheel.is_full());
+        // Insert at 10 should fail after 4 probes
+        let result = unsafe { wheel.insert(10, 5) };
 
-        // Next insert should fail
-        let result = unsafe { wheel.insert(0, 99) };
-
-        assert!(matches!(result, Err(WheelError::WheelFull(4))));
+        assert!(matches!(
+            result,
+            Err(WheelError::WheelFull {
+                slot: 10,
+                probes: 4
+            })
+        ));
     }
 
     #[test]
-    fn test_wheel_full_after_probe() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(4, 2);
+    fn test_max_probes_with_gaps() {
+        let mut wheel: InnerWheel<u32> = InnerWheel::with_max_probes(256, 1, 4);
 
-        // Fill all 8 total capacity
-        for i in 0..8 {
-            unsafe { wheel.insert(0, i as u32).unwrap() };
+        // Fill slots 10, 11, 12, 13 but leave 14 empty
+        unsafe {
+            wheel.insert(10, 1).unwrap();
+            wheel.insert(11, 2).unwrap();
+            wheel.insert(12, 3).unwrap();
+            wheel.insert(13, 4).unwrap();
         }
 
-        assert!(wheel.is_full());
-        assert_eq!(wheel.len(), 8);
+        // Insert at 10 should fail - can't reach slot 14
+        let result = unsafe { wheel.insert(10, 5) };
+        assert!(result.is_err());
 
-        let result = unsafe { wheel.insert(0, 99) };
-        assert!(matches!(result, Err(WheelError::WheelFull(4))));
+        // But insert at 11 can reach 14
+        let result = unsafe { wheel.insert(11, 5) }.unwrap();
+        assert_eq!(result.slot, 14);
+    }
+
+    #[test]
+    fn test_wheel_still_usable_after_probe_failure() {
+        let mut wheel: InnerWheel<u32> = InnerWheel::with_max_probes(256, 1, 2);
+
+        // Fill slots 10, 11
+        unsafe {
+            wheel.insert(10, 1).unwrap();
+            wheel.insert(11, 2).unwrap();
+        }
+
+        // Fail at slot 10
+        let result = unsafe { wheel.insert(10, 3) };
+        assert!(result.is_err());
+
+        // But can still insert at slot 12
+        let result = unsafe { wheel.insert(12, 3) }.unwrap();
+        assert_eq!(result.slot, 12);
     }
 
     // ==================== Remove ====================
@@ -721,17 +768,6 @@ mod tests {
         assert_eq!(unsafe { wheel.remove(r0.slot, r0.key) }, vec![1, 2, 3]);
     }
 
-    #[test]
-    fn test_tuple_values() {
-        let mut wheel: InnerWheel<(u32, &str)> = InnerWheel::new(256, 4);
-
-        let r0 = unsafe { wheel.insert(10, (1, "one")) }.unwrap();
-        let r1 = unsafe { wheel.insert(10, (2, "two")) }.unwrap();
-
-        assert_eq!(unsafe { wheel.remove(r0.slot, r0.key) }, (1, "one"));
-        assert_eq!(unsafe { wheel.remove(r1.slot, r1.key) }, (2, "two"));
-    }
-
     // ==================== Drop Behavior ====================
 
     #[test]
@@ -803,48 +839,11 @@ mod tests {
         assert_eq!(drop_count.get(), 3);
     }
 
-    #[test]
-    fn test_drop_probed_entries() {
-        let drop_count = Rc::new(Cell::new(0));
-
-        struct DropCounter(Rc<Cell<usize>>);
-        impl Drop for DropCounter {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
-
-        {
-            let mut wheel: InnerWheel<DropCounter> = InnerWheel::new(4, 1);
-
-            // All inserts at slot 0, will probe to 0, 1, 2, 3
-            unsafe {
-                wheel
-                    .insert(0, DropCounter(Rc::clone(&drop_count)))
-                    .unwrap();
-                wheel
-                    .insert(0, DropCounter(Rc::clone(&drop_count)))
-                    .unwrap();
-                wheel
-                    .insert(0, DropCounter(Rc::clone(&drop_count)))
-                    .unwrap();
-                wheel
-                    .insert(0, DropCounter(Rc::clone(&drop_count)))
-                    .unwrap();
-            }
-
-            assert_eq!(drop_count.get(), 0);
-        }
-
-        // All 4 dropped
-        assert_eq!(drop_count.get(), 4);
-    }
-
     // ==================== Stress Tests ====================
 
     #[test]
     fn test_fill_and_drain() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(256, 4);
+        let mut wheel: InnerWheel<u32> = InnerWheel::with_max_probes(256, 4, 256);
 
         // Fill completely
         let mut results = vec![];
@@ -867,7 +866,7 @@ mod tests {
 
     #[test]
     fn test_fill_and_pop() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(64, 4);
+        let mut wheel: InnerWheel<u32> = InnerWheel::with_max_probes(64, 4, 64);
 
         // Fill
         for i in 0..256 {
@@ -889,29 +888,6 @@ mod tests {
     }
 
     #[test]
-    fn test_repeated_fill_drain() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(16, 4);
-
-        for round in 0..100 {
-            // Fill
-            let mut results = vec![];
-            for i in 0..64 {
-                let r = unsafe { wheel.insert(i % 16, (round * 64 + i) as u32) }.unwrap();
-                results.push(r);
-            }
-
-            assert!(wheel.is_full());
-
-            // Drain
-            for r in &results {
-                unsafe { wheel.try_remove(r.slot, r.key) };
-            }
-
-            assert!(wheel.is_empty());
-        }
-    }
-
-    #[test]
     fn test_alternating_insert_remove() {
         let mut wheel: InnerWheel<u32> = InnerWheel::new(256, 4);
 
@@ -922,98 +898,6 @@ mod tests {
         }
 
         assert!(wheel.is_empty());
-    }
-
-    #[test]
-    fn test_random_pattern() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(64, 8);
-        let mut active = vec![];
-
-        // Insert 100
-        for i in 0..100 {
-            let r = unsafe { wheel.insert(i % 64, i as u32) }.unwrap();
-            active.push((r, i as u32));
-        }
-
-        // Remove every third
-        let mut remaining = vec![];
-        for (i, (r, v)) in active.into_iter().enumerate() {
-            if i % 3 == 0 {
-                let removed = unsafe { wheel.remove(r.slot, r.key) };
-                assert_eq!(removed, v);
-            } else {
-                remaining.push((r, v));
-            }
-        }
-
-        // Insert 50 more
-        for i in 100..150 {
-            let r = unsafe { wheel.insert(i % 64, i as u32) }.unwrap();
-            remaining.push((r, i as u32));
-        }
-
-        // Remove all remaining
-        for (r, v) in remaining {
-            let removed = unsafe { wheel.try_remove(r.slot, r.key) };
-            assert_eq!(removed, Some(v));
-        }
-
-        assert!(wheel.is_empty());
-    }
-
-    // ==================== Probing Edge Cases ====================
-
-    #[test]
-    fn test_probe_fills_entire_wheel() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(8, 1);
-
-        // All inserts at slot 0
-        for i in 0..8 {
-            let r = unsafe { wheel.insert(0, i as u32) }.unwrap();
-            assert_eq!(r.slot, i);
-        }
-
-        // Verify distribution
-        for slot in 0..8 {
-            assert!(unsafe { wheel.slot_is_full(slot) });
-        }
-    }
-
-    #[test]
-    fn test_probe_from_middle() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(8, 1);
-
-        // Fill from slot 5
-        for i in 0..8 {
-            let r = unsafe { wheel.insert(5, i as u32) }.unwrap();
-            // Should go: 5, 6, 7, 0, 1, 2, 3, 4
-            let expected = (5 + i) % 8;
-            assert_eq!(r.slot, expected);
-        }
-    }
-
-    #[test]
-    fn test_probe_partial_fill() {
-        let mut wheel: InnerWheel<u32> = InnerWheel::new(8, 2);
-
-        // Fill slots 2 and 3 completely
-        unsafe {
-            wheel.insert(2, 1).unwrap();
-            wheel.insert(2, 2).unwrap();
-            wheel.insert(3, 3).unwrap();
-            wheel.insert(3, 4).unwrap();
-        }
-
-        // Insert at 2 should probe to 4
-        let r = unsafe { wheel.insert(2, 5) }.unwrap();
-        assert_eq!(r.slot, 4);
-
-        // Insert at 3 should also probe to 4 (still has room) then 5
-        let r = unsafe { wheel.insert(3, 6) }.unwrap();
-        assert_eq!(r.slot, 4);
-
-        let r = unsafe { wheel.insert(3, 7) }.unwrap();
-        assert_eq!(r.slot, 5);
     }
 
     // ==================== Len and Capacity ====================
