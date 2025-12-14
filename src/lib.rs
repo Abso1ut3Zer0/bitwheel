@@ -1370,3 +1370,323 @@ mod tests {
         assert_eq!(wheel.gear_for_delay(1_000_000_000), 3);
     }
 }
+
+// In src/lib.rs or tests/hdr_latency.rs
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    use hdrhistogram::Histogram;
+    use std::time::{Duration, Instant};
+
+    struct LatencyTimer;
+
+    impl Timer for LatencyTimer {
+        type Context = ();
+
+        fn fire(&mut self, _now: Instant, _ctx: &mut ()) -> Option<Instant> {
+            None
+        }
+    }
+
+    struct PeriodicLatencyTimer {
+        period: Duration,
+        remaining: usize,
+    }
+
+    impl Timer for PeriodicLatencyTimer {
+        type Context = ();
+
+        fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
+            self.remaining -= 1;
+            if self.remaining > 0 {
+                Some(now + self.period)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn print_histogram(name: &str, hist: &Histogram<u64>) {
+        println!("\n=== {} ===", name);
+        println!("  count:  {}", hist.len());
+        println!("  min:    {} ns", hist.min());
+        println!("  max:    {} ns", hist.max());
+        println!("  mean:   {:.1} ns", hist.mean());
+        println!("  stddev: {:.1} ns", hist.stdev());
+        println!("  p50:    {} ns", hist.value_at_quantile(0.50));
+        println!("  p90:    {} ns", hist.value_at_quantile(0.90));
+        println!("  p99:    {} ns", hist.value_at_quantile(0.99));
+        println!("  p99.9:  {} ns", hist.value_at_quantile(0.999));
+        println!("  p99.99: {} ns", hist.value_at_quantile(0.9999));
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_insert_latency() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let iterations = 100_000;
+
+        // Warmup
+        for i in 0..1000 {
+            let when = epoch + Duration::from_millis((i % 500) + 10);
+            let handle = wheel.insert(when, LatencyTimer).unwrap();
+            wheel.cancel(handle);
+        }
+
+        // Measure
+        for i in 0..iterations {
+            let when = epoch + Duration::from_millis((i % 500) + 10);
+
+            let start = Instant::now();
+            let handle = wheel.insert(when, LatencyTimer).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+            wheel.cancel(handle);
+        }
+
+        print_histogram("Insert Latency", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_cancel_latency() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let iterations = 100_000;
+
+        // Warmup
+        for i in 0..1000 {
+            let when = epoch + Duration::from_millis((i % 500) + 10);
+            let handle = wheel.insert(when, LatencyTimer).unwrap();
+            wheel.cancel(handle);
+        }
+
+        // Measure
+        for i in 0..iterations {
+            let when = epoch + Duration::from_millis((i % 500) + 10);
+            let handle = wheel.insert(when, LatencyTimer).unwrap();
+
+            let start = Instant::now();
+            let _ = wheel.cancel(handle);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Cancel Latency", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_empty_latency() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let iterations = 100_000;
+        let mut ctx = ();
+
+        // Warmup
+        for i in 0..1000u64 {
+            let now = epoch + Duration::from_millis(i);
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in 1000..(1000 + iterations) {
+            let now = epoch + Duration::from_millis(i);
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Poll Empty Latency", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_with_pending_no_fires() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+
+        // Insert timers far in future
+        for i in 0..1000 {
+            let when = epoch + Duration::from_millis(1_000_000 + i);
+            let _ = wheel.insert(when, LatencyTimer);
+        }
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let iterations = 100_000;
+        let mut ctx = ();
+
+        // Warmup
+        for i in 0..1000u64 {
+            let now = epoch + Duration::from_millis(i);
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in 1000..(1000 + iterations) {
+            let now = epoch + Duration::from_millis(i);
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Poll With Pending (No Fires) Latency", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_single_fire() {
+        let epoch = Instant::now();
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let iterations = 100_000;
+        let mut ctx = ();
+
+        for i in 0..iterations {
+            let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> =
+                BitWheel::boxed_with_epoch(epoch);
+
+            let when = epoch + Duration::from_millis(10);
+            let _ = wheel.insert(when, LatencyTimer);
+
+            let now = epoch + Duration::from_millis(10 + i % 10);
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Poll Single Fire Latency", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_trading_simulation() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+
+        let mut insert_hist = Histogram::<u64>::new(3).unwrap();
+        let mut poll_hist = Histogram::<u64>::new(3).unwrap();
+        let mut cancel_hist = Histogram::<u64>::new(3).unwrap();
+
+        let mut handles = Vec::with_capacity(100);
+        let mut ctx = ();
+        let mut now = epoch;
+
+        let iterations = 100_000u64;
+
+        // Warmup
+        for i in 0..1000 {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            if i % 5 != 0 {
+                let when = now + Duration::from_millis(50 + (i % 200));
+                if let Ok(handle) = wheel.insert(when, LatencyTimer) {
+                    if handles.len() < 100 {
+                        handles.push(handle);
+                    }
+                }
+            }
+
+            if i % 20 == 0 {
+                if let Some(handle) = handles.pop() {
+                    let _ = wheel.cancel(handle);
+                }
+            }
+        }
+
+        // Measure
+        for i in 0..iterations {
+            now += Duration::from_millis(1);
+
+            // Poll
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
+
+            // Insert 80%
+            if i % 5 != 0 {
+                let when = now + Duration::from_millis(50 + (i % 200));
+
+                let start = Instant::now();
+                if let Ok(handle) = wheel.insert(when, LatencyTimer) {
+                    insert_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+
+                    if handles.len() < 100 {
+                        handles.push(handle);
+                    }
+                }
+            }
+
+            // Cancel 5%
+            if i % 20 == 0 {
+                if let Some(handle) = handles.pop() {
+                    let start = Instant::now();
+                    let _ = wheel.cancel(handle);
+                    cancel_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+                }
+            }
+        }
+
+        print_histogram("Trading Sim - Insert", &insert_hist);
+        print_histogram("Trading Sim - Poll", &poll_hist);
+        print_histogram("Trading Sim - Cancel", &cancel_hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_periodic_reschedule() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<PeriodicLatencyTimer, 4, 1, 64, 8>> =
+            BitWheel::boxed_with_epoch(epoch);
+
+        let mut poll_hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // 10 periodic timers, 100ms period, 100 fires each
+        for i in 0..10 {
+            let when = epoch + Duration::from_millis(100 + i * 10);
+            let timer = PeriodicLatencyTimer {
+                period: Duration::from_millis(100),
+                remaining: 100,
+            };
+            let _ = wheel.insert(when, timer);
+        }
+
+        let mut now = epoch;
+        let end = epoch + Duration::from_millis(15_000); // 15 seconds
+
+        while now < end {
+            now += Duration::from_millis(1);
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
+        }
+
+        print_histogram("Periodic Reschedule - Poll", &poll_hist);
+    }
+}

@@ -8,7 +8,9 @@ thiserror = "2.0.17"
 
 [dev-dependencies]
 criterion = "0.8.1"
+hdrhistogram = "7.5.4"
 
-# [[bench]]
-# name = "inner_wheel_bench"
-# harness = false
+
+[[bench]]
+name = "bitwheel"
+harness = false
