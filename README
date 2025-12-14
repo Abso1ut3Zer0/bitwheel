@@ -1,0 +1,147 @@
+# BitWheel
+
+A high-performance hierarchical timer wheel for Rust, optimized for low-latency trading systems and event-driven applications.
+
+## Features
+
+- **O(1) insert, cancel, and poll** — constant-time operations regardless of timer count
+- **Zero allocation on hot path** — all memory pre-allocated at construction
+- **Nanosecond-level latency** — p50 poll ~15ns, p50 insert ~25ns
+- **Hierarchical design** — efficiently handles timers from milliseconds to hours
+- **Skip-ahead optimization** — jumps directly to next fire time, no idle iteration
+- **Configurable via const generics** — tune gears, resolution, capacity at compile time
+
+## Performance
+
+Measured on realistic trading workload (order timeouts + cancellations):
+
+| Operation | p50 | p99 | p99.9 |
+|-----------|-----|-----|-------|
+| Poll | 15ns | 171ns | 224ns |
+| Insert | 25ns | 41ns | 99ns |
+| Cancel | 14ns | 30ns | 59ns |
+
+## Installation
+```toml
+[dependencies]
+bitwheel = "0.1"
+```
+
+## Usage
+
+### Define a Timer
+```rust
+use bitwheel::{BitWheel, Timer};
+use std::time::{Duration, Instant};
+
+struct OrderTimeout {
+    order_id: u64,
+}
+
+impl Timer for OrderTimeout {
+    type Context = Vec<u64>;  // fired order IDs
+
+    fn fire(&mut self, _now: Instant, ctx: &mut Self::Context) -> Option<Instant> {
+        ctx.push(self.order_id);
+        None  // one-shot, don't reschedule
+    }
+}
+```
+
+### Basic Operations
+```rust
+// Create a timer wheel (boxed due to size)
+let mut wheel: Box<BitWheel<OrderTimeout>> = BitWheel::boxed();
+
+// Insert a timer
+let when = Instant::now() + Duration::from_millis(100);
+let handle = wheel.insert(when, OrderTimeout { order_id: 12345 })?;
+
+// Cancel if needed (e.g., order filled)
+let timer = wheel.cancel(handle);
+
+// Poll in your event loop
+let mut fired_orders = Vec::new();
+let num_fired = wheel.poll(Instant::now(), &mut fired_orders)?;
+```
+
+### Periodic Timers
+```rust
+struct Heartbeat {
+    venue_id: u32,
+    interval: Duration,
+}
+
+impl Timer for Heartbeat {
+    type Context = ();
+
+    fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
+        send_heartbeat(self.venue_id);
+        Some(now + self.interval)  // reschedule
+    }
+}
+```
+
+### Custom Configuration
+```rust
+use bitwheel::BitWheel;
+
+// BitWheel<Timer, NUM_GEARS, RESOLUTION_MS, SLOT_CAP, MAX_PROBES>
+type FastWheel<T> = BitWheel<T, 4, 1, 64, 8>;
+
+let mut wheel: Box<FastWheel<OrderTimeout>> = BitWheel::boxed();
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `NUM_GEARS` | 5 | Hierarchy levels (more = longer max delay) |
+| `RESOLUTION_MS` | 5 | Tick resolution in milliseconds |
+| `SLOT_CAP` | 32 | Max timers per slot before probing |
+| `MAX_PROBES` | 3 | Linear probe limit on collision |
+
+### Delay Coverage by Gears
+
+| Gears | Max Delay | Use Case |
+|-------|-----------|----------|
+| 4 | ~4.6 hours | Intraday trading |
+| 5 | ~12 days | Multi-day sessions |
+| 6 | ~2.2 years | Long-dated expirations |
+
+## Event Loop Integration
+```rust
+use bitwheel::{BitWheel, Timer};
+
+fn run_event_loop<T: Timer>(wheel: &mut BitWheel<T>, ctx: &mut T::Context) {
+    loop {
+        let now = Instant::now();
+        
+        // Poll timers
+        match wheel.poll(now, ctx) {
+            Ok(fired) => { /* fired timers */ }
+            Err(e) => { /* some timers failed to reschedule */ }
+        }
+        
+        // Sleep until next timer (or next event)
+        if let Some(duration) = wheel.duration_until_next() {
+            std::thread::sleep(duration.min(Duration::from_millis(100)));
+        }
+    }
+}
+```
+
+## Architecture
+
+BitWheel uses a hierarchical timer wheel with 64 slots per gear:
+```
+Gear 0: ticks 1-63        (finest resolution)
+Gear 1: ticks 64-4095     (64x coarser)
+Gear 2: ticks 4096-262143 (4096x coarser)
+...
+```
+
+Each slot contains a fixed-capacity slab with O(1) insert/remove via intrusive linked lists. Collisions are handled by linear probing to adjacent slots.
+
+Key optimizations:
+- **Skip-ahead**: Jumps directly to `next_fire_tick`, avoiding idle iteration
+- **Dirty tracking**: Only recomputes gear metadata when timers are removed
+- **Bitmap operations**: O(1) next-slot lookup via `rotate_right` + `trailing_zeros`
