@@ -43,7 +43,7 @@ impl<T, const SLOT_CAP: usize> Gear<T, SLOT_CAP> {
     ///
     /// # Panics
     /// Debug builds panic if slot is already acquired.
-    #[inline]
+    #[inline(always)]
     pub fn acquire(&self, slot: usize) -> SlotGuard<'_, T, SLOT_CAP> {
         debug_assert!(slot < NUM_SLOTS, "slot {slot} out of bounds");
 
@@ -129,43 +129,43 @@ impl<T, const SLOT_CAP: usize> Gear<T, SLOT_CAP> {
     }
 
     /// Check if a slot has entries (via bitmap).
-    #[inline]
+    #[inline(always)]
     pub fn is_slot_occupied(&self, slot: usize) -> bool {
         debug_assert!(slot < NUM_SLOTS, "slot {slot} out of bounds");
         (self.occupied.get() & (1u64 << slot)) != 0
     }
 
     /// Check if entire gear is empty.
-    #[inline]
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.occupied.get() == 0
     }
 
     /// Get the occupied bitmap (for iteration).
-    #[inline]
+    #[inline(always)]
     pub fn occupied_bitmap(&self) -> u64 {
         self.occupied.get()
     }
 
     /// Number of slots (always 64).
-    #[inline]
+    #[inline(always)]
     pub const fn num_slots(&self) -> usize {
         NUM_SLOTS
     }
 
     /// Slot mask (always 63).
-    #[inline]
+    #[inline(always)]
     pub const fn slot_mask(&self) -> usize {
         SLOT_MASK
     }
 
-    #[inline]
+    #[inline(always)]
     fn set_occupied(&self, slot: usize) {
         let bit = 1u64 << slot;
         self.occupied.set(self.occupied.get() | bit);
     }
 
-    #[inline]
+    #[inline(always)]
     fn clear_occupied_if_empty(&self, slot: usize, is_empty: bool) {
         if is_empty {
             let bit = 1u64 << slot;
@@ -185,7 +185,7 @@ pub struct SlotGuard<'a, T, const SLOT_CAP: usize> {
 
 impl<'a, T, const SLOT_CAP: usize> SlotGuard<'a, T, SLOT_CAP> {
     /// Which slot this guard holds.
-    #[inline]
+    #[inline(always)]
     pub fn slot(&self) -> usize {
         self.slot
     }
@@ -194,7 +194,7 @@ impl<'a, T, const SLOT_CAP: usize> SlotGuard<'a, T, SLOT_CAP> {
     ///
     /// # Panics
     /// Panics if slot is full.
-    #[inline]
+    #[inline(always)]
     pub fn insert(&self, value: T) -> usize {
         let slot = self.slot_mut();
         assert!(!slot.is_full(), "slot {} is full", self.slot);
@@ -206,7 +206,7 @@ impl<'a, T, const SLOT_CAP: usize> SlotGuard<'a, T, SLOT_CAP> {
     }
 
     /// Try to insert a value. Returns Err if slot is full.
-    #[inline]
+    #[inline(always)]
     pub fn try_insert(&self, value: T) -> Result<usize, GearError> {
         let slot = self.slot_mut();
         if slot.is_full() {
@@ -220,7 +220,7 @@ impl<'a, T, const SLOT_CAP: usize> SlotGuard<'a, T, SLOT_CAP> {
     }
 
     /// Pop any entry from the slot.
-    #[inline]
+    #[inline(always)]
     pub fn pop(&self) -> Option<T> {
         let slot = self.slot_mut();
         let result = slot.try_pop().map(|(_, v)| v);
@@ -230,7 +230,7 @@ impl<'a, T, const SLOT_CAP: usize> SlotGuard<'a, T, SLOT_CAP> {
     }
 
     /// Try to remove a specific entry by key.
-    #[inline]
+    #[inline(always)]
     pub fn try_remove(&self, key: usize) -> Option<T> {
         let slot = self.slot_mut();
         // SAFETY: try_remove requires key < capacity,
@@ -241,31 +241,43 @@ impl<'a, T, const SLOT_CAP: usize> SlotGuard<'a, T, SLOT_CAP> {
         result
     }
 
+    /// Try to remove a specific entry by key.
+    #[inline(always)]
+    pub fn remove(&self, key: usize) -> T {
+        let slot = self.slot_mut();
+        // SAFETY: remove requires key < capacity,
+        // otherwise it will panic
+        let result = unsafe { slot.remove(key) };
+        self.gear
+            .clear_occupied_if_empty(self.slot, slot.is_empty());
+        result
+    }
+
     /// Check if slot is empty.
-    #[inline]
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.slot_ref().is_empty()
     }
 
     /// Check if slot is full.
-    #[inline]
+    #[inline(always)]
     pub fn is_full(&self) -> bool {
         self.slot_ref().is_full()
     }
 
     /// Number of entries in slot.
-    #[inline]
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.slot_ref().len()
     }
 
-    #[inline]
+    #[inline(always)]
     fn slot_ref(&self) -> &Slot<T, SLOT_CAP> {
         // SAFETY: We have exclusive access via the guard
         unsafe { &*self.gear.slots[self.slot].get() }
     }
 
-    #[inline]
+    #[inline(always)]
     fn slot_mut(&self) -> &mut Slot<T, SLOT_CAP> {
         // SAFETY: We have exclusive access via the guard
         unsafe { &mut *self.gear.slots[self.slot].get() }
