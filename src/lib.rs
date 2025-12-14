@@ -61,6 +61,10 @@ pub struct BitWheel<
     epoch: Instant,
     current_tick: u64,
     next_fire_tick: Option<u64>,
+
+    // Cached min fire tick per gear + dirty tracking
+    gear_next_fire: [Option<u64>; NUM_GEARS],
+    gear_dirty: u64,
 }
 
 impl<
@@ -87,6 +91,7 @@ impl<
     pub fn with_epoch(epoch: Instant) -> Self {
         const {
             assert!(NUM_GEARS >= 1, "must have at least one gear");
+            assert!(NUM_GEARS <= 64, "cannot have more than 64 gears");
             assert!(RESOLUTION_MS >= 1, "resolution must be at least 1ms");
             assert!(
                 6 * NUM_GEARS + (64 - RESOLUTION_MS.leading_zeros() as usize) <= 64,
@@ -100,6 +105,8 @@ impl<
             epoch,
             current_tick: 0,
             next_fire_tick: None,
+            gear_next_fire: [None; NUM_GEARS],
+            gear_dirty: 0,
         }
     }
 
@@ -115,7 +122,6 @@ impl<
         Box::new(Self::with_epoch(epoch))
     }
 
-    /// Duration until next timer fires.
     #[inline(always)]
     pub fn duration_until_next(&self) -> Option<Duration> {
         self.next_fire_tick.map(|next| {
@@ -140,8 +146,10 @@ impl<
         let actual_slot = guard.slot();
         let key = guard.insert(timer);
 
-        // Compute actual fire tick based on gear rotation
+        // Compute actual fire tick and update caches
         let fire_tick = self.compute_fire_tick(gear_idx, actual_slot);
+        self.gear_next_fire[gear_idx] =
+            Some(self.gear_next_fire[gear_idx].map_or(fire_tick, |t| t.min(fire_tick)));
         self.next_fire_tick = Some(self.next_fire_tick.map_or(fire_tick, |t| t.min(fire_tick)));
 
         Ok(TimerHandle {
@@ -153,19 +161,6 @@ impl<
     }
 
     pub fn cancel(&mut self, handle: TimerHandle) -> Option<T> {
-        // SAFETY: This remove is safe due to the following invariants:
-        //
-        // 1. TimerHandle is only created by insert(), which stores valid
-        //    gear/slot/key values at the time of insertion.
-        //
-        // 2. TimerHandle has no Clone/Copy, so ownership is unique.
-        //    Once cancel() takes ownership, no other cancel is possible.
-        //
-        // 3. The when_offset > current_tick check ensures the timer hasn't
-        //    fired yet, so the entry must still exist in the wheel.
-        //
-        // Together these guarantee the key points to a valid, occupied entry.
-
         if handle.when_offset <= self.current_tick {
             return None;
         }
@@ -178,8 +173,25 @@ impl<
             return None;
         }
 
+        // SAFETY: This remove is safe due to the following invariants:
+        //
+        // 1. TimerHandle is only created by insert(), which stores valid
+        //    gear/slot/key values at the time of insertion.
+        //
+        // 2. TimerHandle has no Clone/Copy, so ownership is unique.
+        //    Once cancel() takes ownership, no other cancel is possible.
+        //
+        // 3. The when_offset > current_tick check ensures the timer hasn't
+        //    fired yet, so the entry must still exist in the wheel.
+        //
+        // Together these guarantee the key points to a valid, occupied entry.
         let guard = self.gears[gear_idx].acquire(slot);
-        Some(guard.remove(key))
+        let timer = guard.remove(key);
+
+        // Mark gear dirty - removed timer might have been the min
+        self.gear_dirty |= 1 << gear_idx;
+
+        Some(timer)
     }
 
     pub fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> Result<usize, PollError>
@@ -244,7 +256,6 @@ impl<
         T: Timer,
     {
         for gear_idx in 0..NUM_GEARS {
-            // Gear N only rotates when lower bits are zero
             if gear_idx > 0 {
                 let mask = (1u64 << (6 * gear_idx)) - 1;
                 if (tick & mask) != 0 {
@@ -277,6 +288,9 @@ impl<
                     None => break,
                 }
             };
+
+            // Mark gear dirty since we removed a timer
+            self.gear_dirty |= 1 << gear_idx;
 
             *fired += 1;
 
@@ -318,8 +332,10 @@ impl<
         let actual_slot = guard.slot();
         let key = guard.insert(timer);
 
-        // Compute actual fire tick based on gear rotation
+        // Compute actual fire tick and update caches
         let fire_tick = self.compute_fire_tick(gear_idx, actual_slot);
+        self.gear_next_fire[gear_idx] =
+            Some(self.gear_next_fire[gear_idx].map_or(fire_tick, |t| t.min(fire_tick)));
         self.next_fire_tick = Some(self.next_fire_tick.map_or(fire_tick, |t| t.min(fire_tick)));
 
         Ok(TimerHandle {
@@ -332,16 +348,42 @@ impl<
 
     #[inline(always)]
     fn recompute_next_fire(&mut self) {
-        self.next_fire_tick = None;
+        // Recompute only dirty gears
+        while self.gear_dirty != 0 {
+            let gear_idx = self.gear_dirty.trailing_zeros() as usize;
+            self.gear_dirty &= self.gear_dirty - 1;
 
-        for gear_idx in 0..NUM_GEARS {
-            if let Some(tick) = self.next_fire_in_gear(gear_idx) {
+            self.gear_next_fire[gear_idx] = self.compute_gear_min_fire(gear_idx);
+        }
+
+        // Global min from cached values
+        self.next_fire_tick = None;
+        for &cached in &self.gear_next_fire {
+            if let Some(tick) = cached {
                 self.next_fire_tick = Some(self.next_fire_tick.map_or(tick, |t| t.min(tick)));
             }
         }
     }
 
-    /// Compute the actual tick when a timer in the given gear/slot will fire.
+    #[inline(always)]
+    fn compute_gear_min_fire(&self, gear_idx: usize) -> Option<u64> {
+        let occupied = self.gears[gear_idx].occupied_bitmap();
+        if occupied == 0 {
+            return None;
+        }
+
+        let mut min_tick = u64::MAX;
+        let mut bits = occupied;
+
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            min_tick = min_tick.min(self.compute_fire_tick(gear_idx, slot));
+        }
+
+        Some(min_tick)
+    }
+
     #[inline(always)]
     fn compute_fire_tick(&self, gear_idx: usize, slot: usize) -> u64 {
         let shift = gear_idx * 6;
@@ -355,28 +397,6 @@ impl<
         } else {
             (self.current_tick & !(gear_period - 1)) + gear_period + slot_fire_offset
         }
-    }
-
-    #[inline(always)]
-    fn next_fire_in_gear(&self, gear_idx: usize) -> Option<u64> {
-        let occupied = self.gears[gear_idx].occupied_bitmap();
-        if occupied == 0 {
-            return None;
-        }
-
-        // Find minimum fire tick across all occupied slots
-        let mut min_tick = u64::MAX;
-        let mut bits = occupied;
-
-        while bits != 0 {
-            let slot = bits.trailing_zeros() as usize;
-            bits &= bits - 1; // clear lowest bit
-
-            let tick = self.compute_fire_tick(gear_idx, slot);
-            min_tick = min_tick.min(tick);
-        }
-
-        Some(min_tick)
     }
 
     #[inline(always)]
