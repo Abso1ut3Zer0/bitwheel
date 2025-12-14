@@ -6,7 +6,7 @@ description = "High-performance fixed capacity timer wheel"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Abso1ut3Zer0/bitwheel"
 rust-version = "1.91.0"
-readme = "README.md"
+readme = "README"
 keywords = ["timer", "wheel", "async", "scheduling", "low-latency"]
 categories = [
     "data-structures",
