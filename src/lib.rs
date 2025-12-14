@@ -140,7 +140,9 @@ impl<
         let actual_slot = guard.slot();
         let key = guard.insert(timer);
 
-        self.next_fire_tick = Some(self.next_fire_tick.map_or(when_tick, |t| t.min(when_tick)));
+        // Compute actual fire tick based on gear rotation
+        let fire_tick = self.compute_fire_tick(gear_idx, actual_slot);
+        self.next_fire_tick = Some(self.next_fire_tick.map_or(fire_tick, |t| t.min(fire_tick)));
 
         Ok(TimerHandle {
             when_offset: when_tick,
@@ -184,17 +186,36 @@ impl<
     where
         T: Timer,
     {
+        let target_tick = self.instant_to_tick(now);
+
+        if target_tick <= self.current_tick {
+            return Ok(0);
+        }
+
+        // Fast path: empty wheel, just advance time
         if self.is_empty() {
+            self.current_tick = target_tick;
             return Ok(0);
         }
 
         let mut fired = 0usize;
         let mut lost = 0usize;
 
-        let target_tick = self.instant_to_tick(now);
-
-        if target_tick <= self.current_tick {
-            return Ok(0);
+        // Skip-ahead optimization
+        match self.next_fire_tick {
+            None => {
+                self.current_tick = target_tick;
+                return Ok(0);
+            }
+            Some(nft) if nft > target_tick => {
+                self.current_tick = target_tick;
+                return Ok(0);
+            }
+            Some(nft) => {
+                if nft > self.current_tick + 1 {
+                    self.current_tick = nft - 1;
+                }
+            }
         }
 
         for tick in (self.current_tick + 1)..=target_tick {
@@ -297,7 +318,9 @@ impl<
         let actual_slot = guard.slot();
         let key = guard.insert(timer);
 
-        self.next_fire_tick = Some(self.next_fire_tick.map_or(when_tick, |t| t.min(when_tick)));
+        // Compute actual fire tick based on gear rotation
+        let fire_tick = self.compute_fire_tick(gear_idx, actual_slot);
+        self.next_fire_tick = Some(self.next_fire_tick.map_or(fire_tick, |t| t.min(fire_tick)));
 
         Ok(TimerHandle {
             when_offset: when_tick,
@@ -318,6 +341,22 @@ impl<
         }
     }
 
+    /// Compute the actual tick when a timer in the given gear/slot will fire.
+    #[inline(always)]
+    fn compute_fire_tick(&self, gear_idx: usize, slot: usize) -> u64 {
+        let shift = gear_idx * 6;
+        let gear_period = 1u64 << (shift + 6);
+        let slot_fire_offset = (slot as u64) << shift;
+
+        let current_in_period = self.current_tick & (gear_period - 1);
+
+        if slot_fire_offset > current_in_period {
+            (self.current_tick & !(gear_period - 1)) + slot_fire_offset
+        } else {
+            (self.current_tick & !(gear_period - 1)) + gear_period + slot_fire_offset
+        }
+    }
+
     #[inline(always)]
     fn next_fire_in_gear(&self, gear_idx: usize) -> Option<u64> {
         let occupied = self.gears[gear_idx].occupied_bitmap();
@@ -325,28 +364,19 @@ impl<
             return None;
         }
 
-        let shift = gear_idx * 6;
-        let current_slot = self.slot_for_tick(gear_idx, self.current_tick);
+        // Find minimum fire tick across all occupied slots
+        let mut min_tick = u64::MAX;
+        let mut bits = occupied;
 
-        // Rotate bitmap so current_slot + 1 is at bit 0
-        // Then trailing_zeros gives distance to next occupied slot
-        let rotation = (current_slot as u32 + 1) & 63;
-        let rotated = occupied.rotate_right(rotation);
+        while bits != 0 {
+            let slot = bits.trailing_zeros() as usize;
+            bits &= bits - 1; // clear lowest bit
 
-        let distance = rotated.trailing_zeros();
-        if distance >= 64 {
-            return None;
+            let tick = self.compute_fire_tick(gear_idx, slot);
+            min_tick = min_tick.min(tick);
         }
 
-        let next_slot = (current_slot + 1 + distance as usize) & 63;
-
-        let ticks_to_slot = if next_slot > current_slot {
-            next_slot - current_slot
-        } else {
-            64 - current_slot + next_slot
-        };
-
-        Some(self.current_tick + ((ticks_to_slot as u64) << shift))
+        Some(min_tick)
     }
 
     #[inline(always)]

@@ -24,6 +24,7 @@ pub struct Gear<T, const SLOT_CAP: usize = DEFAULT_SLOT_CAP> {
     locked: Cell<u64>,
 }
 
+#[allow(unused)]
 impl<T, const SLOT_CAP: usize> Gear<T, SLOT_CAP> {
     /// Create a new gear with the given slot capacity.
     pub fn new() -> Self {
@@ -183,6 +184,7 @@ pub struct SlotGuard<'a, T, const SLOT_CAP: usize> {
     slot: usize,
 }
 
+#[allow(unused)]
 impl<'a, T, const SLOT_CAP: usize> SlotGuard<'a, T, SLOT_CAP> {
     /// Which slot this guard holds.
     #[inline(always)]

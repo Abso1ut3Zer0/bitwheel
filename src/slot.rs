@@ -31,6 +31,7 @@ pub struct Slot<T, const CAP: usize = DEFAULT_SLOT_CAP> {
     len: usize,
 }
 
+#[allow(unused)]
 impl<T, const CAP: usize> Slot<T, CAP> {
     pub fn new() -> Self {
         const {
