@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::gear::{Gear, GearError};
+use crate::gear::{Gear, GearError, SLOT_MASK};
 
 mod gear;
 mod slot;
@@ -372,16 +372,16 @@ impl<
             return None;
         }
 
-        let mut min_tick = u64::MAX;
-        let mut bits = occupied;
+        let current_slot = self.slot_for_tick(gear_idx, self.current_tick);
 
-        while bits != 0 {
-            let slot = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            min_tick = min_tick.min(self.compute_fire_tick(gear_idx, slot));
-        }
+        // Rotate so slot after current is at bit 0
+        let rotation = (current_slot as u32 + 1) & (SLOT_MASK as u32);
+        let rotated = occupied.rotate_right(rotation);
 
-        Some(min_tick)
+        let distance = rotated.trailing_zeros() as usize;
+        let next_slot = (current_slot + 1 + distance) & SLOT_MASK;
+
+        Some(self.compute_fire_tick(gear_idx, next_slot))
     }
 
     #[inline(always)]

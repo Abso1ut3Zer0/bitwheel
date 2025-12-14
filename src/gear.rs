@@ -1,8 +1,8 @@
 use crate::{DEFAULT_SLOT_CAP, slot::Slot};
 use std::cell::{Cell, UnsafeCell};
 
-const NUM_SLOTS: usize = 64;
-const SLOT_MASK: usize = 63;
+pub const NUM_SLOTS: usize = 64;
+pub const SLOT_MASK: usize = 63;
 
 /// Error returned when gear operations fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
