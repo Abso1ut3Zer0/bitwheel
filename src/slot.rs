@@ -25,7 +25,7 @@ enum Entry<T> {
 /// - `remove` is only called with valid, occupied keys
 /// - `key < capacity` for all key-based operations
 pub struct Slot<T, const CAP: usize = DEFAULT_SLOT_CAP> {
-    entries: [Entry<T>; CAP],
+    entries: Box<[Entry<T>; CAP]>,
     free_head: usize,
     occupied_head: usize,
     len: usize,
@@ -37,9 +37,10 @@ impl<T, const CAP: usize> Slot<T, CAP> {
             assert!(CAP > 0, "capacity must be > 0");
         }
 
-        let entries: [Entry<T>; CAP] = std::array::from_fn(|i| Entry::Vacant {
+        let entries = Box::new(std::array::from_fn(|i| Entry::Vacant {
             next_free: if i + 1 < CAP { i + 1 } else { NONE },
-        });
+        }));
+
         Self {
             entries,
             free_head: if CAP > 0 { 0 } else { NONE },

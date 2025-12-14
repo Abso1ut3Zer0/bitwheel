@@ -500,7 +500,7 @@ mod tests {
         let handle = wheel.insert(when, timer).unwrap();
         assert!(!wheel.is_empty());
         assert!(wheel.duration_until_next().is_some());
-        assert_eq!(handle.gear, 0); // 100 ticks fits in gear 0 (0-63 range... wait, 100 > 63)
+        assert_eq!(handle.gear, 1); // 100 ticks > 63, goes to gear 1
     }
 
     #[test]
@@ -1184,5 +1184,189 @@ mod tests {
         }
 
         assert_eq!(drop_count.load(Ordering::SeqCst), 10);
+    }
+
+    // ==================== Additional Tests ====================
+
+    #[test]
+    fn test_next_fire_bitmap_wrap_around() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<OneShotTimer, 4, 1, 32, 3>> = BitWheel::boxed_with_epoch(epoch);
+
+        // Insert timer that lands in slot 60
+        let (t1, _) = OneShotTimer::new(1);
+        wheel.insert(epoch + Duration::from_millis(60), t1).unwrap();
+
+        // Advance past slot 60
+        let mut ctx = Vec::new();
+        wheel
+            .poll(epoch + Duration::from_millis(61), &mut ctx)
+            .unwrap();
+
+        // Insert timer in slot 5 (wraps around)
+        let (t2, _) = OneShotTimer::new(2);
+        wheel.insert(epoch + Duration::from_millis(70), t2).unwrap(); // tick 70, slot = 70 & 63 = 6
+
+        // duration_until_next should find the wrapped slot
+        assert!(wheel.duration_until_next().is_some());
+    }
+
+    #[test]
+    fn test_multiple_gears_same_poll() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<OneShotTimer, 4, 1, 32, 3>> = BitWheel::boxed_with_epoch(epoch);
+
+        let (t1, f1) = OneShotTimer::new(1);
+        let (t2, f2) = OneShotTimer::new(2);
+        let (t3, f3) = OneShotTimer::new(3);
+
+        // Gear 0 timer
+        wheel.insert(epoch + Duration::from_millis(10), t1).unwrap();
+        // Gear 1 timer
+        wheel
+            .insert(epoch + Duration::from_millis(100), t2)
+            .unwrap();
+        // Gear 2 timer
+        wheel
+            .insert(epoch + Duration::from_millis(5000), t3)
+            .unwrap();
+
+        let mut ctx = Vec::new();
+
+        // Poll far enough to fire all
+        wheel
+            .poll(epoch + Duration::from_millis(6000), &mut ctx)
+            .unwrap();
+
+        assert!(f1.get());
+        assert!(f2.get());
+        assert!(f3.get());
+        assert_eq!(ctx.len(), 3);
+    }
+
+    #[test]
+    fn test_poll_error_on_reschedule_failure() {
+        let epoch = Instant::now();
+        // Tiny config: 1 slot cap, 1 max probe - reschedule will fail
+        let mut wheel: Box<BitWheel<PeriodicTimer, 4, 1, 1, 1>> = BitWheel::boxed_with_epoch(epoch);
+
+        // Periodic timer at tick 10, will reschedule to tick 16 when fired with now=15ms
+        let timer = PeriodicTimer::new(1, Duration::from_millis(1), 2);
+        wheel
+            .insert(epoch + Duration::from_millis(10), timer)
+            .unwrap();
+
+        // Blocker at tick 16 (slot 16) - blocks the reschedule target
+        // Won't fire yet (poll only goes to tick 15)
+        let blocker = PeriodicTimer::new(99, Duration::from_millis(1000), 1);
+        wheel
+            .insert(epoch + Duration::from_millis(16), blocker)
+            .unwrap();
+
+        let mut ctx = Vec::new();
+        let result = wheel.poll(epoch + Duration::from_millis(15), &mut ctx);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.0 > 0);
+    }
+
+    #[test]
+    fn test_gear_boundary_exact_64() {
+        let epoch = Instant::now();
+        let wheel: Box<BitWheel<OneShotTimer, 4, 1, 32, 3>> = BitWheel::boxed_with_epoch(epoch);
+
+        // delay = 63 → gear 0
+        assert_eq!(wheel.gear_for_delay(63), 0);
+        // delay = 64 → gear 1
+        assert_eq!(wheel.gear_for_delay(64), 1);
+    }
+
+    #[test]
+    fn test_gear_boundary_exact_4096() {
+        let epoch = Instant::now();
+        let wheel: Box<BitWheel<OneShotTimer, 4, 1, 32, 3>> = BitWheel::boxed_with_epoch(epoch);
+
+        // delay = 4095 → gear 1
+        assert_eq!(wheel.gear_for_delay(4095), 1);
+        // delay = 4096 → gear 2
+        assert_eq!(wheel.gear_for_delay(4096), 2);
+    }
+
+    #[test]
+    fn test_insert_after_cancel_reuses_slot() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<OneShotTimer, 4, 1, 2, 3>> = BitWheel::boxed_with_epoch(epoch);
+
+        let when = epoch + Duration::from_millis(10);
+
+        // Fill slot
+        let (t1, _) = OneShotTimer::new(1);
+        let (t2, _) = OneShotTimer::new(2);
+        let h1 = wheel.insert(when, t1).unwrap();
+        let h2 = wheel.insert(when, t2).unwrap();
+
+        // Cancel one
+        wheel.cancel(h1);
+
+        // Should be able to insert into same slot again
+        let (t3, _) = OneShotTimer::new(3);
+        let h3 = wheel.insert(when, t3).unwrap();
+
+        // Should get same slot as cancelled timer
+        assert_eq!(h2.slot, h3.slot);
+    }
+
+    #[test]
+    fn test_periodic_crosses_gear_boundary() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<PeriodicTimer, 4, 1, 32, 3>> =
+            BitWheel::boxed_with_epoch(epoch);
+
+        // Start in gear 0, reschedule with large period that lands in gear 1
+        let timer = PeriodicTimer::new(1, Duration::from_millis(100), 3);
+        wheel
+            .insert(epoch + Duration::from_millis(10), timer)
+            .unwrap();
+
+        let mut ctx = Vec::new();
+
+        // Fire 1: at ~10ms, reschedules to ~110ms (gear 1)
+        wheel
+            .poll(epoch + Duration::from_millis(15), &mut ctx)
+            .unwrap();
+        assert_eq!(ctx.len(), 1);
+
+        // Fire 2: at ~110ms, reschedules to ~210ms (gear 1)
+        wheel
+            .poll(epoch + Duration::from_millis(115), &mut ctx)
+            .unwrap();
+        assert_eq!(ctx.len(), 2);
+
+        // Fire 3: at ~210ms, no reschedule
+        wheel
+            .poll(epoch + Duration::from_millis(215), &mut ctx)
+            .unwrap();
+        assert_eq!(ctx.len(), 3);
+
+        assert!(wheel.is_empty());
+    }
+
+    #[test]
+    fn test_zero_delay_goes_to_gear0() {
+        let epoch = Instant::now();
+        let wheel: Box<BitWheel<OneShotTimer, 4, 1, 32, 3>> = BitWheel::boxed_with_epoch(epoch);
+
+        assert_eq!(wheel.gear_for_delay(0), 0);
+    }
+
+    #[test]
+    fn test_delay_beyond_max_gears_clamps() {
+        let epoch = Instant::now();
+        let wheel: Box<BitWheel<OneShotTimer, 4, 1, 32, 3>> = BitWheel::boxed_with_epoch(epoch);
+
+        // Very large delay should clamp to highest gear (3)
+        assert_eq!(wheel.gear_for_delay(u64::MAX), 3);
+        assert_eq!(wheel.gear_for_delay(1_000_000_000), 3);
     }
 }
