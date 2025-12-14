@@ -126,16 +126,16 @@ impl<
     /// for your use case such that it satisfies the
     /// timer constraints.
     pub const fn gear_granularities() -> [u64; NUM_GEARS] {
-        let mut precisions = [0; NUM_GEARS];
-        precisions[0] = RESOLUTION_MS;
+        let mut granularities = [0; NUM_GEARS];
+        granularities[0] = RESOLUTION_MS;
 
         let mut idx = 1;
         while idx < NUM_GEARS {
-            precisions[idx] = precisions[idx - 1] * (NUM_SLOTS as u64);
+            granularities[idx] = granularities[idx - 1] * (NUM_SLOTS as u64);
             idx += 1;
         }
 
-        precisions
+        granularities
     }
 
     /// Useful for deciding how to scale the `BitWheel`
