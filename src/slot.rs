@@ -1,3 +1,5 @@
+use crate::DEFAULT_SLOT_CAP;
+
 const NONE: usize = usize::MAX;
 
 enum Entry<T> {
@@ -22,29 +24,30 @@ enum Entry<T> {
 /// - `insert` is not called when full
 /// - `remove` is only called with valid, occupied keys
 /// - `key < capacity` for all key-based operations
-pub struct Slot<T> {
+pub struct Slot<T, const CAP: usize = DEFAULT_SLOT_CAP> {
     entries: Box<[Entry<T>]>,
     free_head: usize,
     occupied_head: usize,
     len: usize,
-    capacity: usize,
 }
 
-impl<T> Slot<T> {
-    pub fn with_capacity(capacity: usize) -> Self {
-        let entries = (0..capacity)
+impl<T, const CAP: usize> Slot<T, CAP> {
+    pub fn new() -> Self {
+        const {
+            assert!(CAP > 0, "capacity must be > 0");
+        }
+        let entries = (0..CAP)
             .map(|i| Entry::Vacant {
-                next_free: if i + 1 < capacity { i + 1 } else { NONE },
+                next_free: if i + 1 < CAP { i + 1 } else { NONE },
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
         Self {
             entries,
-            free_head: if capacity > 0 { 0 } else { NONE },
+            free_head: if CAP > 0 { 0 } else { NONE },
             occupied_head: NONE,
             len: 0,
-            capacity,
         }
     }
 
@@ -205,23 +208,23 @@ impl<T> Slot<T> {
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     #[inline]
-    pub fn is_full(&self) -> bool {
-        self.len >= self.capacity
+    pub const fn is_full(&self) -> bool {
+        self.len >= CAP
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 
     #[inline]
-    pub fn capacity(&self) -> usize {
-        self.capacity
+    pub const fn capacity(&self) -> usize {
+        CAP
     }
 }
 
@@ -235,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_new_empty() {
-        let slot: Slot<u32> = Slot::with_capacity(4);
+        let slot: Slot<u32, 4> = Slot::new();
 
         assert!(slot.is_empty());
         assert!(!slot.is_full());
@@ -245,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_insert_single() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let key = unsafe { slot.insert(42) };
 
@@ -257,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_insert_multiple() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(10) };
         let k1 = unsafe { slot.insert(20) };
@@ -274,7 +277,7 @@ mod tests {
 
     #[test]
     fn test_remove_single() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let key = unsafe { slot.insert(42) };
         let value = unsafe { slot.remove(key) };
@@ -286,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_remove_multiple_fifo() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(10) };
         let k1 = unsafe { slot.insert(20) };
@@ -300,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_remove_multiple_lifo() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(10) };
         let k1 = unsafe { slot.insert(20) };
@@ -314,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_remove_middle() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(10) };
         let k1 = unsafe { slot.insert(20) };
@@ -331,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_free_list_reuse_single() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(10) };
         unsafe { slot.remove(k0) };
@@ -342,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_free_list_lifo_order() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(10) };
         let k1 = unsafe { slot.insert(20) };
@@ -366,7 +369,7 @@ mod tests {
 
     #[test]
     fn test_free_list_interleaved() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(10) };
         let k1 = unsafe { slot.insert(20) };
@@ -389,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_fill_empty_refill() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         for i in 0..4 {
             unsafe { slot.insert(i as u32) };
@@ -412,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_try_remove_occupied() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let key = unsafe { slot.insert(42) };
         let result = unsafe { slot.try_remove(key) };
@@ -423,7 +426,7 @@ mod tests {
 
     #[test]
     fn test_try_remove_vacant() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let key = unsafe { slot.insert(42) };
         unsafe { slot.remove(key) };
@@ -434,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_try_remove_never_occupied() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         unsafe { slot.insert(10) };
         unsafe { slot.insert(20) };
@@ -445,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_try_remove_double() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let key = unsafe { slot.insert(42) };
 
@@ -460,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_is_occupied_fresh() {
-        let slot: Slot<u32> = Slot::with_capacity(4);
+        let slot: Slot<u32, 4> = Slot::new();
 
         for i in 0..4 {
             assert!(!unsafe { slot.is_occupied(i) });
@@ -469,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_is_occupied_after_insert() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let key = unsafe { slot.insert(42) };
 
@@ -480,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_is_occupied_after_remove() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let key = unsafe { slot.insert(42) };
         assert!(unsafe { slot.is_occupied(key) });
@@ -493,14 +496,14 @@ mod tests {
 
     #[test]
     fn test_try_pop_empty() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         assert_eq!(slot.try_pop(), None);
     }
 
     #[test]
     fn test_try_pop_single() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let key = unsafe { slot.insert(42) };
 
@@ -511,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_try_pop_multiple() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         unsafe {
             slot.insert(10);
@@ -533,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_try_pop_returns_lifo() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         unsafe {
             slot.insert(10);
@@ -550,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_try_pop_with_gaps() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(10) };
         let _k1 = unsafe { slot.insert(20) };
@@ -568,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_try_pop_then_insert() {
-        let mut slot: Slot<u32> = Slot::with_capacity(2);
+        let mut slot: Slot<u32, 2> = Slot::new();
 
         unsafe {
             slot.insert(10);
@@ -586,7 +589,7 @@ mod tests {
 
     #[test]
     fn test_occupied_list_single_element() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k = unsafe { slot.insert(42) };
 
@@ -598,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_occupied_list_remove_head() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let _k0 = unsafe { slot.insert(10) };
         let _k1 = unsafe { slot.insert(20) };
@@ -617,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_occupied_list_remove_tail() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(10) }; // This is the tail
         let _k1 = unsafe { slot.insert(20) };
@@ -636,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_occupied_list_remove_middle() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let _k0 = unsafe { slot.insert(10) };
         let k1 = unsafe { slot.insert(20) }; // Middle
@@ -655,13 +658,13 @@ mod tests {
 
     #[test]
     fn test_occupied_list_complex_operations() {
-        let mut slot: Slot<u32> = Slot::with_capacity(8);
+        let mut slot: Slot<u32, 8> = Slot::new();
 
-        let k0 = unsafe { slot.insert(10) };
+        let _k0 = unsafe { slot.insert(10) };
         let k1 = unsafe { slot.insert(20) };
         let k2 = unsafe { slot.insert(30) };
         let k3 = unsafe { slot.insert(40) };
-        let k4 = unsafe { slot.insert(50) };
+        let _k4 = unsafe { slot.insert(50) };
 
         unsafe {
             slot.remove(k1);
@@ -688,18 +691,8 @@ mod tests {
     // ==================== Capacity Edge Cases ====================
 
     #[test]
-    fn test_capacity_zero() {
-        let slot: Slot<u32> = Slot::with_capacity(0);
-
-        assert!(slot.is_empty());
-        assert!(slot.is_full());
-        assert_eq!(slot.capacity(), 0);
-        assert_eq!(slot.len(), 0);
-    }
-
-    #[test]
     fn test_capacity_one() {
-        let mut slot: Slot<u32> = Slot::with_capacity(1);
+        let mut slot: Slot<u32, 1> = Slot::new();
 
         assert!(!slot.is_full());
 
@@ -714,7 +707,7 @@ mod tests {
 
     #[test]
     fn test_capacity_large() {
-        let mut slot: Slot<u32> = Slot::with_capacity(1000);
+        let mut slot: Slot<u32, 1000> = Slot::new();
 
         for i in 0..1000 {
             unsafe { slot.insert(i) };
@@ -734,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_string_values() {
-        let mut slot: Slot<String> = Slot::with_capacity(4);
+        let mut slot: Slot<String, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert("hello".to_string()) };
         let k1 = unsafe { slot.insert("world".to_string()) };
@@ -745,7 +738,7 @@ mod tests {
 
     #[test]
     fn test_vec_values() {
-        let mut slot: Slot<Vec<i32>> = Slot::with_capacity(4);
+        let mut slot: Slot<Vec<i32>, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(vec![1, 2, 3]) };
         let k1 = unsafe { slot.insert(vec![4, 5, 6]) };
@@ -756,7 +749,7 @@ mod tests {
 
     #[test]
     fn test_tuple_values() {
-        let mut slot: Slot<(u32, &str)> = Slot::with_capacity(4);
+        let mut slot: Slot<(u32, &str), 4> = Slot::new();
 
         let k0 = unsafe { slot.insert((1, "one")) };
         let k1 = unsafe { slot.insert((2, "two")) };
@@ -779,7 +772,7 @@ mod tests {
         }
 
         {
-            let mut slot: Slot<DropCounter> = Slot::with_capacity(4);
+            let mut slot: Slot<DropCounter, 4> = Slot::new();
 
             unsafe {
                 slot.insert(DropCounter(Rc::clone(&drop_count)));
@@ -805,7 +798,7 @@ mod tests {
         }
 
         {
-            let mut slot: Slot<DropCounter> = Slot::with_capacity(4);
+            let mut slot: Slot<DropCounter, 4> = Slot::new();
 
             let k0 = unsafe { slot.insert(DropCounter(Rc::clone(&drop_count))) };
             unsafe { slot.insert(DropCounter(Rc::clone(&drop_count))) };
@@ -834,7 +827,7 @@ mod tests {
         }
 
         {
-            let mut slot: Slot<DropCounter> = Slot::with_capacity(4);
+            let mut slot: Slot<DropCounter, 4> = Slot::new();
 
             let k0 = unsafe { slot.insert(DropCounter(Rc::clone(&drop_count))) };
             unsafe { slot.remove(k0) };
@@ -849,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_repeated_fill_drain() {
-        let mut slot: Slot<u32> = Slot::with_capacity(8);
+        let mut slot: Slot<u32, 8> = Slot::new();
 
         for round in 0..100 {
             for i in 0..8 {
@@ -864,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_alternating_insert_remove() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         for i in 0..100u32 {
             let key = unsafe { slot.insert(i) };
@@ -877,7 +870,7 @@ mod tests {
 
     #[test]
     fn test_random_pattern() {
-        let mut slot: Slot<u32> = Slot::with_capacity(8);
+        let mut slot: Slot<u32, 8> = Slot::new();
         let mut keys = Vec::new();
 
         for i in 0..5 {
@@ -913,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_key_stability() {
-        let mut slot: Slot<u32> = Slot::with_capacity(4);
+        let mut slot: Slot<u32, 4> = Slot::new();
 
         let k0 = unsafe { slot.insert(100) };
         let k1 = unsafe { slot.insert(200) };
@@ -937,7 +930,7 @@ mod tests {
 
     #[test]
     fn test_large_capacity_pop_performance() {
-        let mut slot: Slot<u32> = Slot::with_capacity(1024);
+        let mut slot: Slot<u32, 1024> = Slot::new();
 
         for i in 0..10 {
             unsafe { slot.insert(i) };
@@ -951,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_large_capacity_sparse() {
-        let mut slot: Slot<u32> = Slot::with_capacity(1024);
+        let mut slot: Slot<u32, 1024> = Slot::new();
 
         let mut keys = Vec::new();
         for i in 0..100 {
