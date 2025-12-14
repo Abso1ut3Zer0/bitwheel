@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::gear::{Gear, GearError, SLOT_MASK};
+use crate::gear::{Gear, GearError, NUM_SLOTS, SLOT_MASK};
 
 mod gear;
 mod slot;
@@ -120,6 +120,40 @@ impl<
 
     pub fn boxed_with_epoch(epoch: Instant) -> Box<Self> {
         Box::new(Self::with_epoch(epoch))
+    }
+
+    /// Useful for deciding how to scale the `BitWheel`
+    /// for your use case such that it satisfies the
+    /// timer constraints.
+    pub const fn gear_granularities() -> [u64; NUM_GEARS] {
+        let mut precisions = [0; NUM_GEARS];
+        precisions[0] = RESOLUTION_MS;
+
+        let mut idx = 1;
+        while idx < NUM_GEARS {
+            precisions[idx] = precisions[idx - 1] * (NUM_SLOTS as u64);
+            idx += 1;
+        }
+
+        precisions
+    }
+
+    /// Useful for deciding how to scale the `BitWheel`
+    /// for your use case such that it does not take
+    /// up a tremendous amount of memory.
+    pub const fn memory_footprint() -> usize {
+        // BitWheel struct (includes Gear array with Slot structs inline)
+        let struct_size = std::mem::size_of::<Self>();
+
+        // Heap allocation: each Slot has Box<[Entry<T>; SLOT_CAP]>
+        // Entry<T> has ~24 bytes overhead (next_occupied, prev_occupied, discriminant)
+        // as a conservative estimate.
+        const ENTRY_OVERHEAD: usize = 24;
+        let entry_size = std::mem::size_of::<T>() + ENTRY_OVERHEAD;
+        let heap_per_slot = SLOT_CAP * entry_size;
+        let total_heap = NUM_GEARS * NUM_SLOTS * heap_per_slot;
+
+        struct_size + total_heap
     }
 
     #[inline(always)]
