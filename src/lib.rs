@@ -1375,8 +1375,6 @@ mod tests {
     }
 }
 
-// In src/lib.rs or tests/hdr_latency.rs
-
 #[cfg(test)]
 mod latency_tests {
     use super::*;
@@ -1402,11 +1400,34 @@ mod latency_tests {
         type Context = ();
 
         fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
-            self.remaining -= 1;
+            self.remaining = self.remaining.saturating_sub(1);
             if self.remaining > 0 {
                 Some(now + self.period)
             } else {
                 None
+            }
+        }
+    }
+
+    enum MixedLatencyTimer {
+        OneShot,
+        Periodic { period: Duration, remaining: usize },
+    }
+
+    impl Timer for MixedLatencyTimer {
+        type Context = ();
+
+        fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
+            match self {
+                MixedLatencyTimer::OneShot => None,
+                MixedLatencyTimer::Periodic { period, remaining } => {
+                    *remaining = remaining.saturating_sub(1);
+                    if *remaining > 0 {
+                        Some(now + *period)
+                    } else {
+                        None
+                    }
+                }
             }
         }
     }
@@ -1489,7 +1510,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_empty_latency() {
+    fn hdr_poll_empty() {
         let epoch = Instant::now();
         let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
 
@@ -1514,12 +1535,12 @@ mod latency_tests {
             hist.record(elapsed).unwrap();
         }
 
-        print_histogram("Poll Empty Latency", &hist);
+        print_histogram("Poll Empty", &hist);
     }
 
     #[test]
     #[ignore]
-    fn hdr_poll_with_pending_no_fires() {
+    fn hdr_poll_pending_no_fires() {
         let epoch = Instant::now();
         let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
 
@@ -1550,26 +1571,34 @@ mod latency_tests {
             hist.record(elapsed).unwrap();
         }
 
-        print_histogram("Poll With Pending (No Fires) Latency", &hist);
+        print_histogram("Poll Pending (No Fires)", &hist);
     }
 
     #[test]
     #[ignore]
     fn hdr_poll_single_fire() {
         let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
-        let iterations = 100_000;
+        let iterations = 100_000u64;
         let mut ctx = ();
 
-        for i in 0..iterations {
-            let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> =
-                BitWheel::boxed_with_epoch(epoch);
+        // Warmup
+        for i in 0..1000u64 {
+            let when = epoch + Duration::from_millis(i + 1);
+            let _ = wheel.insert(when, LatencyTimer);
+            let now = epoch + Duration::from_millis(i + 1);
+            let _ = wheel.poll(now, &mut ctx);
+        }
 
-            let when = epoch + Duration::from_millis(10);
+        // Measure: insert timer, advance time, poll fires it
+        for i in 0..iterations {
+            let tick = 1000 + i;
+            let when = epoch + Duration::from_millis(tick + 1);
             let _ = wheel.insert(when, LatencyTimer);
 
-            let now = epoch + Duration::from_millis(10 + i % 10);
+            let now = epoch + Duration::from_millis(tick + 1);
 
             let start = Instant::now();
             let _ = wheel.poll(now, &mut ctx);
@@ -1578,7 +1607,157 @@ mod latency_tests {
             hist.record(elapsed).unwrap();
         }
 
-        print_histogram("Poll Single Fire Latency", &hist);
+        print_histogram("Poll Single Fire", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_periodic_steady_state() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<PeriodicLatencyTimer, 4, 1, 64, 8>> =
+            BitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // 10 periodic timers, 1ms period (fires every tick)
+        for i in 0..10 {
+            let when = epoch + Duration::from_millis(i + 1);
+            let timer = PeriodicLatencyTimer {
+                period: Duration::from_millis(1),
+                remaining: usize::MAX,
+            };
+            let _ = wheel.insert(when, timer);
+        }
+
+        // Warmup
+        for i in 0..1000u64 {
+            let now = epoch + Duration::from_millis(i + 1);
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in 1000..101_000u64 {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Periodic Steady State (10 timers @ 1ms)", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_mixed_periodic_oneshot() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<MixedLatencyTimer, 4, 1, 64, 8>> =
+            BitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // 10 periodic heartbeats, 10ms period
+        for i in 0..10 {
+            let when = epoch + Duration::from_millis(i + 10);
+            let timer = MixedLatencyTimer::Periodic {
+                period: Duration::from_millis(10),
+                remaining: usize::MAX,
+            };
+            let _ = wheel.insert(when, timer);
+        }
+
+        // Warmup
+        for i in 0..1000u64 {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            // Insert 2 one-shot timers per tick (order timeouts)
+            for j in 0..2 {
+                let when = now + Duration::from_millis(50 + (i + j) % 50);
+                let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
+            }
+
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in 1000..101_000u64 {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            // Insert 2 one-shot timers per tick
+            for j in 0..2 {
+                let when = now + Duration::from_millis(50 + (i + j) % 50);
+                let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
+            }
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Mixed (10 periodic + 2 oneshot/tick)", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_bursty_workload() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheel<MixedLatencyTimer, 4, 1, 128, 16>> =
+            BitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // 10 periodic heartbeats, 10ms period
+        for i in 0..10 {
+            let when = epoch + Duration::from_millis(i + 10);
+            let timer = MixedLatencyTimer::Periodic {
+                period: Duration::from_millis(10),
+                remaining: usize::MAX,
+            };
+            let _ = wheel.insert(when, timer);
+        }
+
+        // Warmup
+        for i in 0..1000u64 {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            // Burst every 100 ticks
+            if i % 100 == 0 {
+                for j in 0..50 {
+                    let when = now + Duration::from_millis(20 + j % 80);
+                    let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
+                }
+            }
+
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in 1000..101_000u64 {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            // Burst every 100 ticks
+            if i % 100 == 0 {
+                for j in 0..50 {
+                    let when = now + Duration::from_millis(20 + j % 80);
+                    let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
+                }
+            }
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Bursty (10 periodic + 50 burst every 100ms)", &hist);
     }
 
     #[test]
@@ -1662,35 +1841,93 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_periodic_reschedule() {
+    fn hdr_realistic_trading() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<PeriodicLatencyTimer, 4, 1, 64, 8>> =
+        let mut wheel: Box<BitWheel<MixedLatencyTimer, 4, 1, 64, 8>> =
             BitWheel::boxed_with_epoch(epoch);
 
+        let mut insert_hist = Histogram::<u64>::new(3).unwrap();
         let mut poll_hist = Histogram::<u64>::new(3).unwrap();
-        let mut ctx = ();
+        let mut cancel_hist = Histogram::<u64>::new(3).unwrap();
 
-        // 10 periodic timers, 100ms period, 100 fires each
-        for i in 0..10 {
-            let when = epoch + Duration::from_millis(100 + i * 10);
-            let timer = PeriodicLatencyTimer {
-                period: Duration::from_millis(100),
-                remaining: 100,
+        let mut handles = Vec::with_capacity(100);
+        let mut ctx = ();
+        let mut now = epoch;
+
+        // Background: 5 venue heartbeats @ 30s period
+        for i in 0..5 {
+            let when = epoch + Duration::from_secs(30) + Duration::from_millis(i * 100);
+            let timer = MixedLatencyTimer::Periodic {
+                period: Duration::from_secs(30),
+                remaining: usize::MAX,
             };
             let _ = wheel.insert(when, timer);
         }
 
-        let mut now = epoch;
-        let end = epoch + Duration::from_millis(15_000); // 15 seconds
+        let iterations = 100_000u64;
 
-        while now < end {
+        // Warmup
+        for i in 0..1000 {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            // 80% of ticks: new order timeout (50-250ms)
+            if i % 5 != 0 {
+                let when = now + Duration::from_millis(50 + (i % 200));
+                if let Ok(handle) = wheel.insert(when, MixedLatencyTimer::OneShot) {
+                    if handles.len() < 100 {
+                        handles.push(handle);
+                    }
+                }
+            }
+
+            // 5% of ticks: order filled, cancel timeout
+            if i % 20 == 0 {
+                if let Some(handle) = handles.pop() {
+                    let _ = wheel.cancel(handle);
+                }
+            }
+        }
+
+        // Measure
+        for i in 0..iterations {
             now += Duration::from_millis(1);
 
+            // Poll (always)
             let start = Instant::now();
             let _ = wheel.poll(now, &mut ctx);
             poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
+
+            // Insert order timeout 80%
+            if i % 5 != 0 {
+                let when = now + Duration::from_millis(50 + (i % 200));
+
+                let start = Instant::now();
+                if let Ok(handle) = wheel.insert(when, MixedLatencyTimer::OneShot) {
+                    insert_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+
+                    if handles.len() < 100 {
+                        handles.push(handle);
+                    }
+                }
+            }
+
+            // Cancel 5% (order filled)
+            if i % 20 == 0 {
+                if let Some(handle) = handles.pop() {
+                    let start = Instant::now();
+                    let _ = wheel.cancel(handle);
+                    cancel_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+                }
+            }
         }
 
-        print_histogram("Periodic Reschedule - Poll", &poll_hist);
+        print_histogram("Realistic Trading - Insert (order timeout)", &insert_hist);
+        print_histogram("Realistic Trading - Poll", &poll_hist);
+        print_histogram("Realistic Trading - Cancel (order fill)", &cancel_hist);
     }
 }
