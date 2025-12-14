@@ -84,7 +84,7 @@ fn bench_insert(c: &mut Criterion) {
             for i in 0..iters {
                 let delay = 100 + (i % 400);
                 let when = epoch + Duration::from_millis(delay);
-                let _ = black_box(wheel.insert(when, BenchOneShotTimer));
+                let _ = wheel.insert(when, BenchOneShotTimer); // ignore error
             }
 
             start.elapsed()
@@ -128,23 +128,30 @@ fn bench_insert(c: &mut Criterion) {
 fn bench_cancel(c: &mut Criterion) {
     c.bench_function("cancel", |b| {
         let epoch = Instant::now();
+        // Larger slot cap to avoid collisions
+        let mut wheel: Box<BitWheel<BenchOneShotTimer, 4, 1, 256, 16>> = BitWheel::boxed();
 
-        b.iter_custom(|iters| {
-            let mut wheel = bench_wheel();
-            let mut handles = Vec::with_capacity(iters as usize);
+        // Pre-fill with spread-out timers
+        let mut handles: Vec<_> = (0..5000)
+            .filter_map(|i| {
+                let when = epoch + Duration::from_millis(i * 100 + 10000);
+                wheel.insert(when, BenchOneShotTimer).ok()
+            })
+            .collect();
 
-            for i in 0..iters {
-                let when = epoch + Duration::from_millis((i % 1000) + 100);
-                handles.push(wheel.insert(when, BenchOneShotTimer).unwrap());
+        b.iter(|| {
+            if let Some(handle) = handles.pop() {
+                black_box(wheel.cancel(handle))
+            } else {
+                // Refill when exhausted
+                handles = (0..5000)
+                    .filter_map(|i| {
+                        let when = epoch + Duration::from_millis(i * 100 + 10000);
+                        wheel.insert(when, BenchOneShotTimer).ok()
+                    })
+                    .collect();
+                None
             }
-
-            let start = Instant::now();
-
-            for handle in handles {
-                let _ = black_box(wheel.cancel(handle));
-            }
-
-            start.elapsed()
         });
     });
 }
@@ -288,150 +295,120 @@ fn bench_duration_until_next(c: &mut Criterion) {
 fn bench_periodic(c: &mut Criterion) {
     let mut group = c.benchmark_group("periodic");
 
-    group.bench_function("insert_periodic", |b| {
-        let epoch = Instant::now();
-
-        b.iter_custom(|iters| {
-            let mut wheel = bench_wheel_periodic();
-            let start = Instant::now();
-
-            for i in 0..iters {
-                let when = epoch + Duration::from_millis((i % 100) + 10);
-                let timer = BenchPeriodicTimer::new(Duration::from_millis(100), 5);
-                let _ = black_box(wheel.insert(when, timer));
-            }
-
-            start.elapsed()
-        });
-    });
-
-    group.bench_function("fire_and_reschedule", |b| {
-        let epoch = Instant::now();
-
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-
-            for _ in 0..iters {
-                let mut wheel = bench_wheel_periodic();
-                let mut ctx = 0usize;
-
-                // Insert periodic timer
-                let timer = BenchPeriodicTimer::new(Duration::from_millis(10), 10);
-                let _ = wheel.insert(epoch + Duration::from_millis(10), timer);
-
-                let start = Instant::now();
-
-                // Poll through 10 fires
-                let _ = wheel.poll(epoch + Duration::from_millis(200), &mut ctx);
-
-                total += start.elapsed();
-            }
-
-            total
-        });
-    });
-
-    for num_timers in [10, 50, 100] {
+    // Pure periodic steady state
+    for num_timers in [1, 10, 50, 100] {
         group.bench_with_input(
-            BenchmarkId::new("heartbeat_simulation", num_timers),
+            BenchmarkId::new("steady_state", num_timers),
             &num_timers,
             |b, &num_timers| {
                 let epoch = Instant::now();
+                let mut wheel = bench_wheel_periodic();
+                let mut ctx = 0usize;
 
-                b.iter_custom(|iters| {
-                    let mut total = Duration::ZERO;
+                for i in 0..num_timers {
+                    let offset = Duration::from_millis(i as u64);
+                    let timer = BenchPeriodicTimer::new(Duration::from_millis(1), usize::MAX);
+                    let _ = wheel.insert(epoch + offset + Duration::from_millis(1), timer);
+                }
 
-                    for _ in 0..iters {
-                        let mut wheel = bench_wheel_periodic();
-                        let mut ctx = 0usize;
+                let mut tick = 0u64;
 
-                        // Insert N heartbeat timers with 30s period
-                        for i in 0..num_timers {
-                            let offset = Duration::from_millis(i as u64 * 100);
-                            let timer = BenchPeriodicTimer::new(Duration::from_secs(30), 5);
-                            let _ = wheel.insert(epoch + offset + Duration::from_secs(30), timer);
-                        }
-
-                        let start = Instant::now();
-
-                        // Simulate 3 minutes, polling every 100ms
-                        let mut now = epoch;
-                        let end = epoch + Duration::from_secs(180);
-                        while now < end {
-                            now += Duration::from_millis(100);
-                            let _ = wheel.poll(now, &mut ctx);
-                        }
-
-                        total += start.elapsed();
-                    }
-
-                    total
+                b.iter(|| {
+                    tick += 1;
+                    let now = epoch + Duration::from_millis(tick);
+                    black_box(wheel.poll(now, &mut ctx))
                 });
             },
         );
     }
 
-    group.bench_function("mixed_oneshot_periodic", |b| {
-        let epoch = Instant::now();
-
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-
-            for _ in 0..iters {
+    // Mixed: periodic background + one-shot arrivals
+    // Simulates heartbeats + order timeouts
+    for (num_periodic, oneshot_rate) in [(10, 2), (10, 10), (50, 5), (50, 20)] {
+        group.bench_with_input(
+            BenchmarkId::new(
+                "mixed",
+                format!("{}periodic_{}oneshot_per_tick", num_periodic, oneshot_rate),
+            ),
+            &(num_periodic, oneshot_rate),
+            |b, &(num_periodic, oneshot_rate)| {
+                let epoch = Instant::now();
                 let mut wheel: Box<BitWheel<MixedTimer, 4, 1, 64, 8>> = BitWheel::boxed();
                 let mut ctx = 0usize;
 
-                // 80% one-shot, 20% periodic
-                for i in 0..100 {
-                    let when = epoch + Duration::from_millis((i * 10) + 10);
-                    let timer = if i % 5 == 0 {
-                        MixedTimer::Periodic {
-                            period: Duration::from_millis(50),
-                            remaining: 3,
-                        }
-                    } else {
-                        MixedTimer::OneShot
+                // Background periodic timers (heartbeats every 10ms)
+                for i in 0..num_periodic {
+                    let offset = Duration::from_millis(i as u64);
+                    let timer = MixedTimer::Periodic {
+                        period: Duration::from_millis(10),
+                        remaining: usize::MAX,
                     };
-                    let _ = wheel.insert(when, timer);
+                    let _ = wheel.insert(epoch + offset + Duration::from_millis(10), timer);
                 }
 
-                let start = Instant::now();
+                let mut tick = 0u64;
 
-                // Poll through entire range
-                let _ = wheel.poll(epoch + Duration::from_millis(2000), &mut ctx);
+                b.iter(|| {
+                    tick += 1;
+                    let now = epoch + Duration::from_millis(tick);
 
-                total += start.elapsed();
-            }
+                    // Insert new one-shot timers (order timeouts, 50-100ms delay)
+                    for j in 0..oneshot_rate {
+                        let delay = 50 + (tick + j) % 50;
+                        let when = now + Duration::from_millis(delay);
+                        let _ = wheel.insert(when, MixedTimer::OneShot);
+                    }
 
-            total
-        });
-    });
+                    black_box(wheel.poll(now, &mut ctx))
+                });
+            },
+        );
+    }
 
-    group.bench_function("rapid_reschedule", |b| {
-        // Timer that reschedules every 1ms
-        let epoch = Instant::now();
-
-        b.iter_custom(|iters| {
-            let mut total = Duration::ZERO;
-
-            for _ in 0..iters {
-                let mut wheel = bench_wheel_periodic();
+    // Bursty: periodic background + occasional burst of one-shots
+    // Simulates heartbeats + order fill burst
+    for (num_periodic, burst_size) in [(10, 50), (10, 100), (50, 100)] {
+        group.bench_with_input(
+            BenchmarkId::new(
+                "bursty",
+                format!("{}periodic_{}burst_every_100", num_periodic, burst_size),
+            ),
+            &(num_periodic, burst_size),
+            |b, &(num_periodic, burst_size)| {
+                let epoch = Instant::now();
+                let mut wheel: Box<BitWheel<MixedTimer, 4, 1, 128, 16>> = BitWheel::boxed();
                 let mut ctx = 0usize;
 
-                let timer = BenchPeriodicTimer::new(Duration::from_millis(1), 100);
-                let _ = wheel.insert(epoch + Duration::from_millis(1), timer);
+                // Background periodic timers
+                for i in 0..num_periodic {
+                    let offset = Duration::from_millis(i as u64);
+                    let timer = MixedTimer::Periodic {
+                        period: Duration::from_millis(10),
+                        remaining: usize::MAX,
+                    };
+                    let _ = wheel.insert(epoch + offset + Duration::from_millis(10), timer);
+                }
 
-                let start = Instant::now();
+                let mut tick = 0u64;
 
-                // Poll through 100 fires
-                let _ = wheel.poll(epoch + Duration::from_millis(150), &mut ctx);
+                b.iter(|| {
+                    tick += 1;
+                    let now = epoch + Duration::from_millis(tick);
 
-                total += start.elapsed();
-            }
+                    // Burst of one-shots every 100 ticks
+                    if tick % 100 == 0 {
+                        for j in 0..burst_size {
+                            let delay = 20 + j % 80;
+                            let when = now + Duration::from_millis(delay);
+                            let _ = wheel.insert(when, MixedTimer::OneShot);
+                        }
+                    }
 
-            total
-        });
-    });
+                    black_box(wheel.poll(now, &mut ctx))
+                });
+            },
+        );
+    }
 
     group.finish();
 }

@@ -184,6 +184,10 @@ impl<
     where
         T: Timer,
     {
+        if self.is_empty() {
+            return Ok(0);
+        }
+
         let mut fired = 0usize;
         let mut lost = 0usize;
 
