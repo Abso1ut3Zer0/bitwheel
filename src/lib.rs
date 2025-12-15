@@ -8,6 +8,8 @@ use std::time::Instant;
 pub use failover::*;
 pub use wheel::*;
 
+use crate::gear::InsertError;
+
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("{0} timers failed to reschedule")]
 pub struct PollError(usize);
@@ -15,6 +17,72 @@ pub struct PollError(usize);
 pub trait Timer {
     type Context;
     fn fire(&mut self, now: Instant, ctx: &mut Self::Context) -> Option<Instant>;
+}
+
+/// Trait for timer driver implementations.
+///
+/// Enables generic runtime code that works with any wheel variant.
+pub trait TimerDriver<T: Timer> {
+    /// Insert a timer to fire at the given instant.
+    ///
+    /// Returns a handle for cancellation, or an error containing the timer
+    /// if the wheel is at capacity.
+    fn insert(&mut self, when: Instant, timer: T) -> Result<TimerHandle, InsertError<T>>;
+
+    /// Cancel a pending timer.
+    ///
+    /// Returns the timer if still pending, `None` if already fired or invalid handle.
+    fn cancel(&mut self, handle: TimerHandle) -> Option<T>;
+
+    /// Poll the wheel, firing all timers due by `now`.
+    ///
+    /// Returns the number of timers fired, or an error if timers were lost
+    /// during rescheduling.
+    fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> Result<usize, PollError>;
+}
+
+impl<T, const G: usize, const R: u64, const S: usize, const P: usize> TimerDriver<T>
+    for BitWheel<T, G, R, S, P>
+where
+    T: Timer,
+{
+    #[inline(always)]
+    fn insert(&mut self, when: Instant, timer: T) -> Result<TimerHandle, InsertError<T>> {
+        BitWheel::insert(self, when, timer)
+    }
+
+    #[inline(always)]
+    fn cancel(&mut self, handle: TimerHandle) -> Option<T> {
+        BitWheel::cancel(self, handle)
+    }
+
+    #[inline(always)]
+    fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> Result<usize, PollError> {
+        BitWheel::poll(self, now, ctx)
+    }
+}
+
+impl<T, const G: usize, const R: u64, const S: usize, const P: usize, const F: u64> TimerDriver<T>
+    for BitWheelWithFailover<T, G, R, S, P, F>
+where
+    T: Timer,
+{
+    /// Infallible insert - always succeeds, overflows to BTreeMap.
+    #[inline(always)]
+    fn insert(&mut self, when: Instant, timer: T) -> Result<TimerHandle, InsertError<T>> {
+        Ok(BitWheelWithFailover::insert(self, when, timer))
+    }
+
+    #[inline(always)]
+    fn cancel(&mut self, handle: TimerHandle) -> Option<T> {
+        BitWheelWithFailover::cancel(self, handle)
+    }
+
+    /// Infallible poll - reschedule failures go to failover, never lost.
+    #[inline(always)]
+    fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> Result<usize, PollError> {
+        Ok(BitWheelWithFailover::poll(self, now, ctx))
+    }
 }
 
 /// Handle for cancelling a pending timer.
