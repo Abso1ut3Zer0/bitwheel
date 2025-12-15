@@ -1,16 +1,24 @@
 use crate::{DEFAULT_SLOT_CAP, slot::Slot};
-use std::cell::{Cell, UnsafeCell};
+use std::{
+    cell::{Cell, UnsafeCell},
+    fmt::Debug,
+};
 
 pub const NUM_SLOTS: usize = 64;
 pub const SLOT_MASK: usize = 63;
 
-/// Error returned when gear operations fail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GearError {
-    /// No available slot found within max probes.
-    NoAvailableSlot { target: usize, probes: usize },
-    /// Slot is full (cannot insert).
-    SlotFull { slot: usize },
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("no available slot")]
+pub struct NoAvailableSlot;
+
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("wheel capacity exceeded")]
+pub struct InsertError<T>(pub T);
+
+impl<T> Debug for InsertError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wheel capacity exceeded")
+    }
 }
 
 /// A single gear (level) in the timer wheel.
@@ -70,7 +78,7 @@ impl<T, const SLOT_CAP: usize> Gear<T, SLOT_CAP> {
         &self,
         target: usize,
         max_probes: usize,
-    ) -> Result<SlotGuard<'_, T, SLOT_CAP>, GearError> {
+    ) -> Result<SlotGuard<'_, T, SLOT_CAP>, NoAvailableSlot> {
         debug_assert!(target < NUM_SLOTS, "target {target} out of bounds");
 
         for probe in 0..max_probes {
@@ -84,10 +92,7 @@ impl<T, const SLOT_CAP: usize> Gear<T, SLOT_CAP> {
             }
         }
 
-        Err(GearError::NoAvailableSlot {
-            target,
-            probes: max_probes,
-        })
+        Err(NoAvailableSlot)
     }
 
     /// Find and acquire the next available (non-full) slot,
@@ -103,7 +108,7 @@ impl<T, const SLOT_CAP: usize> Gear<T, SLOT_CAP> {
         excluded: usize,
         target: usize,
         max_probes: usize,
-    ) -> Result<SlotGuard<'_, T, SLOT_CAP>, GearError> {
+    ) -> Result<SlotGuard<'_, T, SLOT_CAP>, NoAvailableSlot> {
         debug_assert!(target < NUM_SLOTS, "target {target} out of bounds");
         debug_assert!(excluded < NUM_SLOTS, "excluded {excluded} out of bounds");
 
@@ -123,10 +128,7 @@ impl<T, const SLOT_CAP: usize> Gear<T, SLOT_CAP> {
             }
         }
 
-        Err(GearError::NoAvailableSlot {
-            target,
-            probes: max_probes,
-        })
+        Err(NoAvailableSlot)
     }
 
     /// Check if a slot has entries (via bitmap).
@@ -209,10 +211,10 @@ impl<'a, T, const SLOT_CAP: usize> SlotGuard<'a, T, SLOT_CAP> {
 
     /// Try to insert a value. Returns Err if slot is full.
     #[inline(always)]
-    pub fn try_insert(&self, value: T) -> Result<usize, GearError> {
+    pub fn try_insert(&self, value: T) -> Result<usize, InsertError<T>> {
         let slot = self.slot_mut();
         if slot.is_full() {
-            return Err(GearError::SlotFull { slot: self.slot });
+            return Err(InsertError(value));
         }
 
         // SAFETY: Slot::insert requires not full, which we just checked
@@ -429,7 +431,7 @@ mod tests {
         assert!(guard.is_full());
 
         let result = guard.try_insert(3);
-        assert!(matches!(result, Err(GearError::SlotFull { slot: 10 })));
+        assert!(matches!(result, Err(InsertError(3))));
     }
 
     // ==================== try_remove ====================
@@ -689,7 +691,7 @@ mod tests {
 
         // excluded=0, max_probes=1 only checks slot 10, fails
         let result = gear.acquire_next_available_excluding(0, 10, 1);
-        assert!(matches!(result, Err(GearError::NoAvailableSlot { .. })));
+        assert!(matches!(result, Err(NoAvailableSlot)));
 
         // max_probes=2 checks 10, 11, succeeds
         let guard = gear.acquire_next_available_excluding(0, 10, 2).unwrap();
@@ -731,13 +733,7 @@ mod tests {
 
         // excluded=9, target=10, max_probes=3 -> checks 10,11,12 all full
         let result = gear.acquire_next_available_excluding(9, 10, 3);
-        assert!(matches!(
-            result,
-            Err(GearError::NoAvailableSlot {
-                target: 10,
-                probes: 3
-            })
-        ));
+        assert!(matches!(result, Err(NoAvailableSlot)));
     }
 
     #[test]
@@ -750,7 +746,7 @@ mod tests {
 
         // excluded=11, target=10, max_probes=3 -> checks 10(full), 11(excluded), 12(full)
         let result = gear.acquire_next_available_excluding(11, 10, 3);
-        assert!(matches!(result, Err(GearError::NoAvailableSlot { .. })));
+        assert!(matches!(result, Err(NoAvailableSlot)));
     }
 
     // ==================== Edge Slot Indices ====================
