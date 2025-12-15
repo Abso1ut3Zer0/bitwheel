@@ -24,7 +24,7 @@ pub trait Timer {
 /// Trait for timer driver implementations.
 ///
 /// Enables generic runtime code that works with any wheel variant.
-pub trait TimerDriver<T: Timer> {
+pub trait TimerDriver<T: Timer>: Default {
     /// Insert a timer to fire at the given instant.
     ///
     /// Returns a handle for cancellation, or an error containing the timer

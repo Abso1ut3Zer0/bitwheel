@@ -30,7 +30,9 @@ impl<
     const RESOLUTION_MS: u64,
     const SLOT_CAP: usize,
     const MAX_PROBES: usize,
-> Default for BitWheelWithFailover<T, NUM_GEARS, RESOLUTION_MS, SLOT_CAP, MAX_PROBES>
+    const FAILOVER_INTERVAL: u64,
+> Default
+    for BitWheelWithFailover<T, NUM_GEARS, RESOLUTION_MS, SLOT_CAP, MAX_PROBES, FAILOVER_INTERVAL>
 {
     fn default() -> Self {
         Self::new()
