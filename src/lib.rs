@@ -3,6 +3,8 @@ mod gear;
 mod slot;
 mod wheel;
 
+mod comparisons;
+
 use std::time::Instant;
 
 pub use failover::*;
