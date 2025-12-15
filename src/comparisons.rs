@@ -684,3 +684,346 @@ mod btreemap {
         print_histogram("Interleaved Insert", &hist);
     }
 }
+
+#[cfg(test)]
+mod hhwt {
+    use hdrhistogram::Histogram;
+    use hierarchical_hash_wheel_timer::wheels::{
+        TimerEntryWithDelay,
+        cancellable::{CancellableTimerEntry, QuadWheelWithOverflow},
+    };
+    use std::time::{Duration, Instant};
+
+    const WARMUP: u64 = 100_000;
+    const ITERATIONS: u64 = 1_000_000;
+
+    // Our timer entry implementing their trait
+    #[derive(Clone, Debug)]
+    struct TimerEntry {
+        id: u64,
+        delay: Duration,
+    }
+
+    impl TimerEntry {
+        fn new(id: u64, delay_ms: u32) -> Self {
+            Self {
+                id,
+                delay: Duration::from_millis(delay_ms as u64),
+            }
+        }
+    }
+
+    impl TimerEntryWithDelay for TimerEntry {
+        fn delay(&self) -> Duration {
+            self.delay
+        }
+    }
+
+    impl CancellableTimerEntry for TimerEntry {
+        type Id = u64;
+
+        fn id(&self) -> &Self::Id {
+            &self.id
+        }
+    }
+
+    type HhwtWheel = QuadWheelWithOverflow<TimerEntry>;
+
+    fn print_histogram(name: &str, hist: &Histogram<u64>) {
+        println!("\n=== {} ===", name);
+        println!("  count:  {}", hist.len());
+        println!("  min:    {} ns", hist.min());
+        println!("  max:    {} ns", hist.max());
+        println!("  mean:   {:.1} ns", hist.mean());
+        println!("  stddev: {:.1} ns", hist.stdev());
+        println!("  p50:    {} ns", hist.value_at_quantile(0.50));
+        println!("  p90:    {} ns", hist.value_at_quantile(0.90));
+        println!("  p99:    {} ns", hist.value_at_quantile(0.99));
+        println!("  p99.9:  {} ns", hist.value_at_quantile(0.999));
+        println!("  p99.99: {} ns", hist.value_at_quantile(0.9999));
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_insert_latency_hhwt() {
+        let mut wheel: HhwtWheel = QuadWheelWithOverflow::new();
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut id = 0u64;
+
+        // Warmup
+        for i in 0..WARMUP {
+            let delay = ((i % 500) + 10) as u32;
+            let entry = TimerEntry::new(id, delay);
+            wheel.insert(entry).unwrap();
+            wheel.cancel(&id).unwrap();
+            id += 1;
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let delay = ((i % 500) + 10) as u32;
+            let entry = TimerEntry::new(id, delay);
+
+            let start = Instant::now();
+            wheel.insert(entry).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+            wheel.cancel(&id).unwrap();
+            id += 1;
+        }
+
+        print_histogram("Insert Latency", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_cancel_latency_hhwt() {
+        let mut wheel: HhwtWheel = QuadWheelWithOverflow::new();
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut id = 0u64;
+
+        // Warmup
+        for i in 0..WARMUP {
+            let delay = ((i % 500) + 10) as u32;
+            let entry = TimerEntry::new(id, delay);
+            wheel.insert(entry).unwrap();
+            wheel.cancel(&id).unwrap();
+            id += 1;
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let delay = ((i % 500) + 10) as u32;
+            let entry = TimerEntry::new(id, delay);
+            wheel.insert(entry).unwrap();
+
+            let start = Instant::now();
+            let _ = wheel.cancel(&id);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+            id += 1;
+        }
+
+        print_histogram("Cancel Latency", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_empty_hhwt() {
+        let mut wheel: HhwtWheel = QuadWheelWithOverflow::new();
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+
+        // Warmup
+        for _ in 0..WARMUP {
+            let _ = wheel.tick();
+        }
+
+        // Measure
+        for _ in 0..ITERATIONS {
+            let start = Instant::now();
+            let _ = wheel.tick();
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Poll Empty", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_pending_no_fires_hhwt() {
+        let mut wheel: HhwtWheel = QuadWheelWithOverflow::new();
+
+        // Insert timers far in future
+        for id in 0..1000u64 {
+            let delay = 100_000_000 + (id as u32);
+            let entry = TimerEntry::new(id, delay);
+            let _ = wheel.insert(entry);
+        }
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+
+        // Warmup
+        for _ in 0..WARMUP {
+            let _ = wheel.tick();
+        }
+
+        // Measure
+        for _ in 0..ITERATIONS {
+            let start = Instant::now();
+            let _ = wheel.tick();
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Poll Pending (No Fires)", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_single_fire_hhwt() {
+        let mut wheel: HhwtWheel = QuadWheelWithOverflow::new();
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut id = 0u64;
+
+        // Warmup
+        for _ in 0..WARMUP {
+            let entry = TimerEntry::new(id, 1);
+            wheel.insert(entry).unwrap();
+            let _ = wheel.tick();
+            id += 1;
+        }
+
+        // Measure
+        for _ in 0..ITERATIONS {
+            let entry = TimerEntry::new(id, 1);
+            wheel.insert(entry).unwrap();
+
+            let start = Instant::now();
+            let _ = wheel.tick();
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+            id += 1;
+        }
+
+        print_histogram("Poll Single Fire", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_interleaved_insert_hhwt() {
+        let mut wheel: HhwtWheel = QuadWheelWithOverflow::new();
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut id = 0u64;
+        let mut tick = 0u64;
+
+        // Pre-populate: timers at regular intervals (every 10ms from 100-10000ms)
+        for i in 0..10_000u64 {
+            let delay = (100 + i * 10) as u32;
+            let entry = TimerEntry::new(id, delay);
+            let _ = wheel.insert(entry);
+            id += 1;
+        }
+
+        // Warmup
+        for i in 0..WARMUP {
+            let _ = wheel.tick();
+            tick += 1;
+
+            let base = 100 + ((i % 9900) * 10);
+            let delay = (base + 5) as u32;
+            let entry = TimerEntry::new(id, delay);
+            let _ = wheel.insert(entry);
+            id += 1;
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let _ = wheel.tick();
+            tick += 1;
+
+            // Replenish grid timers
+            if i % 10 == 0 {
+                let entry = TimerEntry::new(id, 10000);
+                let _ = wheel.insert(entry);
+                id += 1;
+            }
+
+            // Interleaved insert
+            let base = ((tick % 9900) + 100) as u32;
+            let offset = ((i % 3) * 2 + 3) as u32;
+            let delay = base + offset;
+            let entry = TimerEntry::new(id, delay);
+
+            let start = Instant::now();
+            let _ = wheel.insert(entry);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+            id += 1;
+        }
+
+        print_histogram("Interleaved Insert", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_realistic_trading_hhwt() {
+        let mut wheel: HhwtWheel = QuadWheelWithOverflow::new();
+
+        let mut insert_hist = Histogram::<u64>::new(3).unwrap();
+        let mut poll_hist = Histogram::<u64>::new(3).unwrap();
+        let mut cancel_hist = Histogram::<u64>::new(3).unwrap();
+
+        let mut handles = Vec::with_capacity(100);
+        let mut id = 0u64;
+
+        // Warmup
+        for i in 0..WARMUP {
+            let _ = wheel.tick();
+
+            if i % 5 != 0 {
+                let delay = (50 + (i % 200)) as u32;
+                let entry = TimerEntry::new(id, delay);
+                wheel.insert(entry).unwrap();
+                if handles.len() < 100 {
+                    handles.push(id);
+                }
+                id += 1;
+            }
+
+            if i % 20 == 0 {
+                if let Some(handle_id) = handles.pop() {
+                    let _ = wheel.cancel(&handle_id);
+                }
+            }
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let start = Instant::now();
+            let _ = wheel.tick();
+            poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
+
+            if i % 5 != 0 {
+                let delay = (50 + (i % 200)) as u32;
+                let entry = TimerEntry::new(id, delay);
+
+                let start = Instant::now();
+                wheel.insert(entry).unwrap();
+                insert_hist
+                    .record(start.elapsed().as_nanos() as u64)
+                    .unwrap();
+
+                if handles.len() < 100 {
+                    handles.push(id);
+                }
+                id += 1;
+            }
+
+            if i % 20 == 0 {
+                if let Some(handle_id) = handles.pop() {
+                    let start = Instant::now();
+                    let _ = wheel.cancel(&handle_id);
+                    cancel_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+                }
+            }
+        }
+
+        print_histogram("Realistic Trading - Insert (order timeout)", &insert_hist);
+        print_histogram("Realistic Trading - Poll", &poll_hist);
+        print_histogram("Realistic Trading - Cancel (order fill)", &cancel_hist);
+    }
+}
