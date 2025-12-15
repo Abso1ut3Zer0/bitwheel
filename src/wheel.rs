@@ -1454,9 +1454,14 @@ mod tests {
 
 #[cfg(test)]
 mod latency_tests {
+    use crate::{BalancedWheel, BurstWheel};
+
     use super::*;
     use hdrhistogram::Histogram;
     use std::time::{Duration, Instant};
+
+    const WARMUP: u64 = 100_000;
+    const ITERATIONS: u64 = 1_000_000;
 
     struct LatencyTimer;
 
@@ -1525,22 +1530,21 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_insert_latency() {
+    fn hdr_insert_latency_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
-        let iterations = 100_000;
 
         // Warmup
-        for i in 0..1000 {
+        for i in 0..WARMUP {
             let when = epoch + Duration::from_millis((i % 500) + 10);
             let handle = wheel.insert(when, LatencyTimer).unwrap();
             wheel.cancel(handle);
         }
 
         // Measure
-        for i in 0..iterations {
+        for i in 0..ITERATIONS {
             let when = epoch + Duration::from_millis((i % 500) + 10);
 
             let start = Instant::now();
@@ -1556,22 +1560,21 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_cancel_latency() {
+    fn hdr_cancel_latency_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
-        let iterations = 100_000;
 
         // Warmup
-        for i in 0..1000 {
+        for i in 0..WARMUP {
             let when = epoch + Duration::from_millis((i % 500) + 10);
             let handle = wheel.insert(when, LatencyTimer).unwrap();
             wheel.cancel(handle);
         }
 
         // Measure
-        for i in 0..iterations {
+        for i in 0..ITERATIONS {
             let when = epoch + Duration::from_millis((i % 500) + 10);
             let handle = wheel.insert(when, LatencyTimer).unwrap();
 
@@ -1587,22 +1590,21 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_empty() {
+    fn hdr_poll_empty_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
-        let iterations = 100_000;
         let mut ctx = ();
 
         // Warmup
-        for i in 0..1000u64 {
+        for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i);
             let _ = wheel.poll(now, &mut ctx);
         }
 
         // Measure
-        for i in 1000..(1000 + iterations) {
+        for i in WARMUP..(WARMUP + ITERATIONS) {
             let now = epoch + Duration::from_millis(i);
 
             let start = Instant::now();
@@ -1617,28 +1619,27 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_pending_no_fires() {
+    fn hdr_poll_pending_no_fires_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         // Insert timers far in future
         for i in 0..1000 {
-            let when = epoch + Duration::from_millis(1_000_000 + i);
+            let when = epoch + Duration::from_millis(100_000_000 + i);
             let _ = wheel.insert(when, LatencyTimer);
         }
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
-        let iterations = 100_000;
         let mut ctx = ();
 
         // Warmup
-        for i in 0..1000u64 {
+        for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i);
             let _ = wheel.poll(now, &mut ctx);
         }
 
         // Measure
-        for i in 1000..(1000 + iterations) {
+        for i in WARMUP..(WARMUP + ITERATIONS) {
             let now = epoch + Duration::from_millis(i);
 
             let start = Instant::now();
@@ -1653,16 +1654,15 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_single_fire() {
+    fn hdr_poll_single_fire_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
-        let iterations = 100_000u64;
         let mut ctx = ();
 
         // Warmup
-        for i in 0..1000u64 {
+        for i in 0..WARMUP {
             let when = epoch + Duration::from_millis(i + 1);
             let _ = wheel.insert(when, LatencyTimer);
             let now = epoch + Duration::from_millis(i + 1);
@@ -1670,8 +1670,8 @@ mod latency_tests {
         }
 
         // Measure: insert timer, advance time, poll fires it
-        for i in 0..iterations {
-            let tick = 1000 + i;
+        for i in 0..ITERATIONS {
+            let tick = WARMUP + i;
             let when = epoch + Duration::from_millis(tick + 1);
             let _ = wheel.insert(when, LatencyTimer);
 
@@ -1689,10 +1689,9 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_periodic_steady_state() {
+    fn hdr_periodic_steady_state_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<PeriodicLatencyTimer, 4, 1, 64, 8>> =
-            BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BalancedWheel<PeriodicLatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
@@ -1708,13 +1707,13 @@ mod latency_tests {
         }
 
         // Warmup
-        for i in 0..1000u64 {
+        for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i + 1);
             let _ = wheel.poll(now, &mut ctx);
         }
 
         // Measure
-        for i in 1000..101_000u64 {
+        for i in WARMUP..(WARMUP + ITERATIONS) {
             let now = epoch + Duration::from_millis(i + 1);
 
             let start = Instant::now();
@@ -1729,10 +1728,9 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_mixed_periodic_oneshot() {
+    fn hdr_mixed_periodic_oneshot_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<MixedLatencyTimer, 4, 1, 64, 8>> =
-            BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BalancedWheel<MixedLatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
@@ -1748,7 +1746,7 @@ mod latency_tests {
         }
 
         // Warmup
-        for i in 0..1000u64 {
+        for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i + 1);
 
             // Insert 2 one-shot timers per tick (order timeouts)
@@ -1761,7 +1759,7 @@ mod latency_tests {
         }
 
         // Measure
-        for i in 1000..101_000u64 {
+        for i in WARMUP..(WARMUP + ITERATIONS) {
             let now = epoch + Duration::from_millis(i + 1);
 
             // Insert 2 one-shot timers per tick
@@ -1782,10 +1780,9 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_bursty_workload() {
+    fn hdr_bursty_workload_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<MixedLatencyTimer, 4, 1, 128, 16>> =
-            BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BurstWheel<MixedLatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
@@ -1801,7 +1798,7 @@ mod latency_tests {
         }
 
         // Warmup
-        for i in 0..1000u64 {
+        for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i + 1);
 
             // Burst every 100 ticks
@@ -1816,7 +1813,7 @@ mod latency_tests {
         }
 
         // Measure
-        for i in 1000..101_000u64 {
+        for i in WARMUP..(WARMUP + ITERATIONS) {
             let now = epoch + Duration::from_millis(i + 1);
 
             // Burst every 100 ticks
@@ -1839,9 +1836,9 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_trading_simulation() {
+    fn hdr_trading_simulation_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<LatencyTimer, 4, 1, 64, 8>> = BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut insert_hist = Histogram::<u64>::new(3).unwrap();
         let mut poll_hist = Histogram::<u64>::new(3).unwrap();
@@ -1851,10 +1848,8 @@ mod latency_tests {
         let mut ctx = ();
         let mut now = epoch;
 
-        let iterations = 100_000u64;
-
         // Warmup
-        for i in 0..1000 {
+        for i in 0..WARMUP {
             now += Duration::from_millis(1);
             let _ = wheel.poll(now, &mut ctx);
 
@@ -1875,7 +1870,7 @@ mod latency_tests {
         }
 
         // Measure
-        for i in 0..iterations {
+        for i in 0..ITERATIONS {
             now += Duration::from_millis(1);
 
             // Poll
@@ -1918,10 +1913,9 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_realistic_trading() {
+    fn hdr_realistic_trading_standard() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<MixedLatencyTimer, 4, 1, 64, 8>> =
-            BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BalancedWheel<MixedLatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut insert_hist = Histogram::<u64>::new(3).unwrap();
         let mut poll_hist = Histogram::<u64>::new(3).unwrap();
@@ -1941,10 +1935,8 @@ mod latency_tests {
             let _ = wheel.insert(when, timer);
         }
 
-        let iterations = 100_000u64;
-
         // Warmup
-        for i in 0..1000 {
+        for i in 0..WARMUP {
             now += Duration::from_millis(1);
             let _ = wheel.poll(now, &mut ctx);
 
@@ -1967,7 +1959,7 @@ mod latency_tests {
         }
 
         // Measure
-        for i in 0..iterations {
+        for i in 0..ITERATIONS {
             now += Duration::from_millis(1);
 
             // Poll (always)
@@ -2006,5 +1998,57 @@ mod latency_tests {
         print_histogram("Realistic Trading - Insert (order timeout)", &insert_hist);
         print_histogram("Realistic Trading - Poll", &poll_hist);
         print_histogram("Realistic Trading - Cancel (order fill)", &cancel_hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_interleaved_insert_standard() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+        let mut now = epoch;
+
+        // Pre-populate: timers at regular intervals (every 10ms from 100-10000ms)
+        for i in 0..10_000 {
+            let when = epoch + Duration::from_millis(100 + i * 10);
+            let _ = wheel.insert(when, LatencyTimer);
+        }
+
+        // Warmup - insert timers that land BETWEEN existing entries
+        for i in 0..WARMUP {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            let base = 100 + ((i % 990) * 10);
+            let when = epoch + Duration::from_millis(base + 5);
+            let _ = wheel.insert(when, LatencyTimer);
+        }
+
+        // Measure - every insert lands between two existing timers
+        for i in 0..ITERATIONS {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            // Replenish the "grid" timers as they fire
+            if i % 10 == 0 {
+                let when = now + Duration::from_millis(10000);
+                let _ = wheel.insert(when, LatencyTimer);
+            }
+
+            // The measured insert: always between existing entries
+            let base = ((now.duration_since(epoch).as_millis() as u64) % 9900) + 100;
+            let offset = (i % 3) * 2 + 3; // 3, 5, or 7
+            let when = epoch + Duration::from_millis(base + offset);
+
+            let start = Instant::now();
+            let _ = wheel.insert(when, LatencyTimer);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Interleaved Insert", &hist);
     }
 }

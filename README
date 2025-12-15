@@ -1,37 +1,20 @@
 # BitWheel
 
-A high-performance hierarchical timer wheel for Rust, optimized for low-latency trading systems and event-driven applications.
+A high-performance hierarchical timer wheel for Rust, optimized for consistent low-latency for event-driven applications.
 
 ## Features
 
-- **O(1) insert, cancel, and poll** — constant-time operations regardless of timer count
-- **Zero allocation on hot path** — all memory pre-allocated at construction
-- **Nanosecond-level latency** — p50 poll ~15ns, p50 insert ~25ns
-- **Hierarchical design** — efficiently handles timers from milliseconds to hours
-- **Skip-ahead optimization** — jumps directly to next fire time, no idle iteration
-- **Configurable via const generics** — tune gears, resolution, capacity at compile time
+- **O(1) operations** — insert, cancel, and poll are constant-time regardless of timer count
+- **Predictable tail latency** — no cascading between gears eliminates latency spikes
+- **Zero allocation on hot path** — all memory pre-allocated; trades memory for determinism
+- **Bounded capacity by design** — insert failure signals backpressure, not a bug
+- **Failover option** — `BitWheelWithFailover` gracefully degrades to BTreeMap when full
+- **Precision tradeoff** — coarser gears sacrifice millisecond precision (does a 1-hour timer need it?)
+- **Compile-time configuration** — tune resolution, capacity, and range via const generics
 
-## Performance
-
-Measured on realistic trading workload (order timeouts + cancellations):
-
-| Operation | p50 | p99 | p99.9 |
-|-----------|-----|-----|-------|
-| Poll | 15ns | 171ns | 224ns |
-| Insert | 25ns | 41ns | 99ns |
-| Cancel | 14ns | 30ns | 59ns |
-
-## Installation
-```toml
-[dependencies]
-bitwheel = "0.1"
-```
-
-## Usage
-
-### Define a Timer
+## Quick Start
 ```rust
-use bitwheel::{BitWheel, Timer};
+use bitwheel::{BalancedWheel, Timer, TimerHandle};
 use std::time::{Duration, Instant};
 
 struct OrderTimeout {
@@ -39,109 +22,222 @@ struct OrderTimeout {
 }
 
 impl Timer for OrderTimeout {
-    type Context = Vec<u64>;  // fired order IDs
+    type Context = Vec<u64>;
 
     fn fire(&mut self, _now: Instant, ctx: &mut Self::Context) -> Option<Instant> {
         ctx.push(self.order_id);
-        None  // one-shot, don't reschedule
+        None // one-shot
+    }
+}
+
+fn main() {
+    let mut wheel: Box<BalancedWheel<OrderTimeout>> = BalancedWheel::boxed();
+    
+    // Insert a timer
+    let when = Instant::now() + Duration::from_millis(100);
+    let handle = wheel.insert(when, OrderTimeout { order_id: 12345 }).unwrap();
+    
+    // Cancel if order fills
+    if let Some(timer) = wheel.cancel(handle) {
+        println!("Cancelled order {}", timer.order_id);
+    }
+    
+    // Poll in event loop
+    let mut fired = Vec::new();
+    wheel.poll(Instant::now(), &mut fired).unwrap();
+}
+```
+
+## Preconfigured Wheels
+
+BitWheel provides type aliases for common use cases:
+
+| Type | Resolution | Range | Slot Cap | Use Case |
+|------|------------|-------|----------|----------|
+| `BalancedWheel` | 5ms | ~23 hours | 16 | General purpose |
+| `BalancedFastWheel` | 5ms | ~23 hours | 64 | Minimal probing |
+| `BalancedLightWheel` | 5ms | ~23 hours | 8 | Memory constrained |
+| `PreciseWheel` | 1ms | ~4.7 hours | 16 | Sub-10ms timeouts |
+| `BurstWheel` | 5ms | ~23 hours | 32 | High timer density |
+| `ExtendedWheel` | 16ms | ~3 days | 16 | Long-running timers |
+
+Each has a `WithFailover` variant (e.g., `BalancedWheelWithFailover`) that falls back to BTreeMap on overflow.
+```rust
+use bitwheel::{PreciseWheel, BurstWheelWithFailover};
+
+// 1ms resolution for tight timeouts
+let mut precise: Box<PreciseWheel<MyTimer>> = PreciseWheel::boxed();
+
+// High capacity with safety net
+let mut burst: Box<BurstWheelWithFailover<MyTimer>> = BurstWheelWithFailover::boxed();
+```
+
+## Design Philosophy
+
+### Insert Can Fail (And That's OK)
+
+Unlike most timer implementations, `BitWheel::insert` returns `Result`. When slots overflow:
+```rust
+match wheel.insert(when, timer) {
+    Ok(handle) => { /* timer scheduled */ }
+    Err(InsertError(timer)) => {
+        // Capacity exceeded — apply backpressure
+        // This is a feature: your config doesn't match your workload
     }
 }
 ```
 
-### Basic Operations
+For systems where dropping timers is unacceptable, use `BitWheelWithFailover`:
 ```rust
-// Create a timer wheel (boxed due to size)
-let mut wheel: Box<BitWheel<OrderTimeout>> = BitWheel::boxed();
+use bitwheel::BalancedWheelWithFailover;
 
-// Insert a timer
-let when = Instant::now() + Duration::from_millis(100);
-let handle = wheel.insert(when, OrderTimeout { order_id: 12345 })?;
+let mut wheel: Box<BalancedWheelWithFailover<MyTimer>> = 
+    BitWheelWithFailover::boxed();
 
-// Cancel if needed (e.g., order filled)
-let timer = wheel.cancel(handle);
-
-// Poll in your event loop
-let mut fired_orders = Vec::new();
-let num_fired = wheel.poll(Instant::now(), &mut fired_orders)?;
+// Never fails — overflows go to BTreeMap
+let handle = wheel.insert(when, timer);
 ```
 
-### Periodic Timers
-```rust
-struct Heartbeat {
-    venue_id: u32,
-    interval: Duration,
-}
+### Precision vs. Predictability
 
-impl Timer for Heartbeat {
-    type Context = ();
+Traditional hierarchical wheels cascade timers between levels as time advances. This causes latency spikes when many timers move simultaneously.
 
-    fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
-        send_heartbeat(self.venue_id);
-        Some(now + self.interval)  // reschedule
-    }
-}
-```
+BitWheel trades precision for predictability:
+- Timers in higher gears (longer delays) have coarser resolution
+- A 1-hour timer might fire within a ~64ms window — acceptable for most use cases
+- No cascading means no surprise latency spikes
 
-### Custom Configuration
+### Memory Tradeoff
+
+BitWheel pre-allocates all slot storage at construction:
+
+| Configuration | Approximate Memory |
+|---------------|-------------------|
+| `BalancedWheel` | ~200 KB |
+| `BalancedFastWheel` | ~800 KB |
+| `BurstWheel` | ~400 KB |
+
+This trades memory for determinism — no allocator calls during insert/poll.
+
+## How It's Fast
+
+**Hierarchical gear design**: 64 slots per gear, each gear 64× coarser than the previous. 4 gears cover ~4.6 hours at 5ms resolution.
+
+**Skip-ahead optimization**: Tracks `next_fire_tick` globally. Empty polls jump directly to the next timer instead of iterating idle slots.
+
+**Bitmap-accelerated lookup**: Each gear maintains a 64-bit occupied bitmap. Finding the next non-empty slot is `rotate_right` + `trailing_zeros` — a few CPU cycles.
+
+**Dirty tracking**: Gear metadata only recomputes when timers are removed, not on every poll.
+
+**Fixed-size slabs with intrusive lists**: Each slot is a pre-allocated slab with O(1) insert/remove via intrusive linked lists. No pointer chasing through heap allocations.
+
+**No cascading**: Timers stay in their original slot until they fire. Higher gears have lower precision, but zero overhead from timer migration.
+
+## Benchmarks
+
+Measured with HDR histograms (100k warmup, 1M iterations, `--release`).
+
+### Interleaved Insert Latency
+
+Timers inserted between existing entries — stresses tree rebalancing and cascading.
+
+| Percentile | BitWheel | BitWheel+Failover | BTreeMap | HHWT |
+|------------|----------|-------------------|----------|------|
+| p50 | **26 ns** | 27 ns | 34 ns | 39 ns |
+| p90 | **28 ns** | 31 ns | 49 ns | 54 ns |
+| p99 | **34 ns** | 50 ns | 100 ns | 278 ns |
+| p99.9 | **48 ns** | 75 ns | 131 ns | 990 ns |
+| p99.99 | **209 ns** | 209 ns | 365 ns | 2757 ns |
+
+### Realistic Trading Simulation
+
+Order timeout management: 80% inserts, 5% cancels, continuous polling.
+
+| Operation | BitWheel | BitWheel+Failover | BTreeMap | HHWT |
+|-----------|----------|-------------------|----------|------|
+| Insert p50 | **26 ns** | 27 ns | 42 ns | 28 ns |
+| Insert p99.9 | **61 ns** | 66 ns | 79 ns | 87 ns |
+| Poll p50 | **15 ns** | 17 ns | 17 ns | 19 ns |
+| Poll p99.9 | **61 ns** | 65 ns | 149 ns | 1515 ns |
+| Cancel p50 | **14 ns** | 14 ns | 54 ns | 20 ns |
+| Cancel p99.9 | **33 ns** | 36 ns | 156 ns | 45 ns |
+
+### Summary
+
+| Metric | vs BTreeMap | vs HHWT |
+|--------|-------------|---------|
+| Insert | 1.4-1.7× faster | ~same p50, 2× better p99.9 |
+| Cancel | **3.6× faster** | 1.4× slower p50, similar tail |
+| Poll tail (p99.9) | **1.6× better** | **14× better** |
+| Predictability (stddev) | 2× better | 9× better |
+
+Comparisons:
+- **BTreeMap**: `BTreeMap<(u64, u32), T>` — similar to tokio's internal timer
+- **HHWT**: [hierarchical_hash_wheel_timer](https://crates.io/crates/hierarchical_hash_wheel_timer) v1.3
+
+## Advanced Configuration
 ```rust
 use bitwheel::BitWheel;
 
 // BitWheel<Timer, NUM_GEARS, RESOLUTION_MS, SLOT_CAP, MAX_PROBES>
-type FastWheel<T> = BitWheel<T, 4, 1, 64, 8>;
-
-let mut wheel: Box<FastWheel<OrderTimeout>> = BitWheel::boxed();
+type CustomWheel<T> = BitWheel<T, 4, 1, 64, 8>;
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `NUM_GEARS` | 5 | Hierarchy levels (more = longer max delay) |
-| `RESOLUTION_MS` | 5 | Tick resolution in milliseconds |
-| `SLOT_CAP` | 32 | Max timers per slot before probing |
-| `MAX_PROBES` | 3 | Linear probe limit on collision |
+| `RESOLUTION_MS` | 5 | Base tick resolution in milliseconds |
+| `SLOT_CAP` | 32 | Timers per slot before probing |
+| `MAX_PROBES` | 3 | Linear probe distance on collision |
 
-### Delay Coverage by Gears
+### Capacity Planning
 
-| Gears | Max Delay | Use Case |
-|-------|-----------|----------|
-| 4 | ~4.6 hours | Intraday trading |
-| 5 | ~12 days | Multi-day sessions |
-| 6 | ~2.2 years | Long-dated expirations |
+Each gear has 64 slots. When a slot fills to `SLOT_CAP`, inserts probe linearly to adjacent slots.
+
+**Total capacity**: `64 × NUM_GEARS × SLOT_CAP` timers (theoretical max)
+
+**Hotspot capacity**: `SLOT_CAP × MAX_PROBES` timers at the same target time
+
+#### The Probing Tradeoff
+
+| Config | Latency | Memory | Best For |
+|--------|---------|--------|----------|
+| Large `SLOT_CAP`, small `MAX_PROBES` | Tight tails | Higher | Latency-critical systems |
+| Small `SLOT_CAP`, large `MAX_PROBES` | Variable tails | Lower | Memory-constrained systems |
+
+**Why probing hurts tails**: Each probe is a potential cache miss and adds branches. With `MAX_PROBES=2`, insert is almost always single-slot. With `MAX_PROBES=16`, worst-case insert touches 16 slots.
+
+#### Sizing for Your Workload
+
+1. **Estimate hotspot density**: How many timers fire within one tick? (e.g., 1000 orders/sec × 100ms timeout = 100 timers per 1ms tick)
+
+2. **Set `SLOT_CAP`** to handle typical density without probing
+
+3. **Set `MAX_PROBES`** for burst headroom (2-4× typical density)
+
+4. **Use failover** if drops are unacceptable: `BitWheelWithFailover` catches overflow in a BTreeMap
 
 ## Event Loop Integration
 ```rust
-use bitwheel::{BitWheel, Timer};
+use bitwheel::{BalancedWheel, Timer};
+use std::time::{Duration, Instant};
 
-fn run_event_loop<T: Timer>(wheel: &mut BitWheel<T>, ctx: &mut T::Context) {
+fn event_loop<T: Timer>(wheel: &mut BalancedWheel<T>, ctx: &mut T::Context) {
     loop {
-        let now = Instant::now();
-        
         // Poll timers
-        match wheel.poll(now, ctx) {
-            Ok(fired) => { /* fired timers */ }
-            Err(e) => { /* some timers failed to reschedule */ }
+        if let Err(e) = wheel.poll(Instant::now(), ctx) {
+            eprintln!("{} timers failed to reschedule", e.0);
         }
         
-        // Sleep until next timer (or next event)
-        if let Some(duration) = wheel.duration_until_next() {
-            std::thread::sleep(duration.min(Duration::from_millis(100)));
+        // Sleep until next timer or max interval
+        match wheel.duration_until_next() {
+            Some(d) => std::thread::sleep(d.min(Duration::from_millis(100))),
+            None => std::thread::sleep(Duration::from_millis(100)),
         }
     }
 }
 ```
 
-## Architecture
+## License
 
-BitWheel uses a hierarchical timer wheel with 64 slots per gear:
-```
-Gear 0: ticks 1-63        (finest resolution)
-Gear 1: ticks 64-4095     (64x coarser)
-Gear 2: ticks 4096-262143 (4096x coarser)
-...
-```
-
-Each slot contains a fixed-capacity slab with O(1) insert/remove via intrusive linked lists. Collisions are handled by linear probing to adjacent slots.
-
-Key optimizations:
-- **Skip-ahead**: Jumps directly to `next_fire_tick`, avoiding idle iteration
-- **Dirty tracking**: Only recomputes gear metadata when timers are removed
-- **Bitmap operations**: O(1) next-slot lookup via `rotate_right` + `trailing_zeros`
+MIT OR Apache-2.0
