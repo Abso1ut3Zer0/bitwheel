@@ -8,17 +8,20 @@ use crate::{
     TimerHandle, gear::InsertError,
 };
 
+pub const DEFAULT_FAILOVER_INTERVAL: u64 = 32;
+
 pub struct BitWheelWithFailover<
     T,
     const NUM_GEARS: usize = DEFAULT_GEARS,
     const RESOLUTION_MS: u64 = DEFAULT_RESOLUTION_MS,
     const SLOT_CAP: usize = DEFAULT_SLOT_CAP,
     const MAX_PROBES: usize = DEFAULT_MAX_PROBES,
+    const FAILOVER_INTERVAL: u64 = DEFAULT_FAILOVER_INTERVAL,
 > {
     wheel: BitWheel<T, NUM_GEARS, RESOLUTION_MS, SLOT_CAP, MAX_PROBES>,
     failover: BTreeMap<(u64, u32), T>,
-    last_lap: u64,
     sequence: u32,
+    last_check: u64,
 }
 
 impl<
@@ -40,13 +43,14 @@ impl<
     const RESOLUTION_MS: u64,
     const SLOT_CAP: usize,
     const MAX_PROBES: usize,
-> BitWheelWithFailover<T, NUM_GEARS, RESOLUTION_MS, SLOT_CAP, MAX_PROBES>
+    const FAILOVER_INTERVAL: u64,
+> BitWheelWithFailover<T, NUM_GEARS, RESOLUTION_MS, SLOT_CAP, MAX_PROBES, FAILOVER_INTERVAL>
 {
     pub fn new() -> Self {
         Self {
             wheel: BitWheel::new(),
             failover: BTreeMap::new(),
-            last_lap: 0,
+            last_check: 0,
             sequence: 0,
         }
     }
@@ -55,7 +59,7 @@ impl<
         Self {
             wheel: BitWheel::with_epoch(epoch),
             failover: BTreeMap::new(),
-            last_lap: 0,
+            last_check: 0,
             sequence: 0,
         }
     }
@@ -109,11 +113,11 @@ impl<
 
         let mut fired_from_failover = 0;
 
-        // Only drain failover on lap boundary (every 64 ticks of gear 0)
-        let current_lap = self.wheel.current_tick() >> 6;
+        // Check failover every FAILOVER_INTERVAL ticks
+        let current_interval = self.wheel.current_tick() / FAILOVER_INTERVAL;
 
-        if current_lap > self.last_lap && !self.failover.is_empty() {
-            self.last_lap = current_lap;
+        if current_interval > self.last_check && !self.failover.is_empty() {
+            self.last_check = current_interval;
             let current_tick = self.wheel.current_tick();
 
             while let Some(entry) = self.failover.first_entry() {
@@ -491,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn test_poll_failover_not_drained_before_lap() {
+    fn test_poll_failover_not_drained_before_interval() {
         let epoch = Instant::now();
         let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 1, 1>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -508,13 +512,13 @@ mod tests {
 
         let mut ctx = Vec::new();
 
-        // Poll at 30ms - before lap boundary, failover should NOT drain
-        wheel.poll(epoch + Duration::from_millis(30), &mut ctx);
+        // Poll at 20ms - before interval boundary, failover should NOT drain
+        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
         assert!(!f2.get());
         assert_eq!(wheel.failover_len(), 1);
 
-        // Poll at 50ms - still before lap boundary
-        wheel.poll(epoch + Duration::from_millis(50), &mut ctx);
+        // Poll at 31ms - still before interval boundary
+        wheel.poll(epoch + Duration::from_millis(31), &mut ctx);
         assert!(!f2.get());
         assert_eq!(wheel.failover_len(), 1);
     }
@@ -832,7 +836,7 @@ mod tests {
     // ==================== Lap Boundary Tests ====================
 
     #[test]
-    fn test_failover_drains_exactly_at_lap_boundary() {
+    fn test_failover_drains_at_interval_boundary() {
         let epoch = Instant::now();
         let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 1, 1>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -849,17 +853,16 @@ mod tests {
 
         let mut ctx = Vec::new();
 
-        // Poll at exactly 63ms - just before lap boundary
-        wheel.poll(epoch + Duration::from_millis(63), &mut ctx);
+        // Poll at 31ms - just before interval boundary
+        wheel.poll(epoch + Duration::from_millis(31), &mut ctx);
         assert!(!f2.get());
         assert_eq!(wheel.failover_len(), 1);
 
-        // Poll at 64ms - crosses lap boundary, failover drains
-        wheel.poll(epoch + Duration::from_millis(64), &mut ctx);
+        // Poll at 32ms - crosses interval boundary, failover drains
+        wheel.poll(epoch + Duration::from_millis(32), &mut ctx);
         assert!(f2.get());
         assert_eq!(wheel.failover_len(), 0);
     }
-
     #[test]
     fn test_multiple_lap_boundaries() {
         let epoch = Instant::now();
