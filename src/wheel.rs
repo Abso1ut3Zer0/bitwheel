@@ -196,44 +196,10 @@ impl<
     where
         T: Timer,
     {
-        let target_tick = self.instant_to_tick(now);
-
-        if target_tick <= self.current_tick {
-            return Ok(0);
-        }
-
-        // Fast path: empty wheel, just advance time
-        if self.is_empty() {
-            self.current_tick = target_tick;
-            return Ok(0);
-        }
-
-        let mut fired = 0usize;
         let mut lost = 0usize;
-
-        // Skip-ahead optimization
-        match self.next_fire_tick {
-            None => {
-                self.current_tick = target_tick;
-                return Ok(0);
-            }
-            Some(nft) if nft > target_tick => {
-                self.current_tick = target_tick;
-                return Ok(0);
-            }
-            Some(nft) => {
-                if nft > self.current_tick + 1 {
-                    self.current_tick = nft - 1;
-                }
-            }
-        }
-
-        for tick in (self.current_tick + 1)..=target_tick {
-            self.poll_tick(tick, now, ctx, &mut fired, &mut lost);
-        }
-
-        self.current_tick = target_tick;
-        self.recompute_next_fire();
+        let fired = self.poll_with_failover(now, ctx, |_, _| {
+            lost += 1;
+        });
 
         if lost > 0 {
             Err(PollError(lost))
@@ -243,13 +209,65 @@ impl<
     }
 
     #[inline(always)]
+    pub(crate) fn poll_with_failover(
+        &mut self,
+        now: Instant,
+        ctx: &mut T::Context,
+        mut failover: impl FnMut(u64, T),
+    ) -> usize
+    where
+        T: Timer,
+    {
+        let target_tick = self.instant_to_tick(now);
+
+        if target_tick <= self.current_tick {
+            return 0;
+        }
+
+        // Fast path: empty wheel, just advance time
+        if self.is_empty() {
+            self.current_tick = target_tick;
+            return 0;
+        }
+
+        let mut fired = 0usize;
+
+        // Skip-ahead optimization
+        match self.next_fire_tick {
+            None => {
+                self.current_tick = target_tick;
+                return 0;
+            }
+            Some(nft) if nft > target_tick => {
+                self.current_tick = target_tick;
+                return 0;
+            }
+            Some(nft) => {
+                if nft > self.current_tick + 1 {
+                    self.current_tick = nft - 1;
+                }
+            }
+        }
+
+        for tick in (self.current_tick + 1)..=target_tick {
+            self.poll_tick(tick, now, ctx, &mut fired, |when, timer| {
+                failover(when, timer)
+            });
+        }
+
+        self.current_tick = target_tick;
+        self.recompute_next_fire();
+        fired
+    }
+
+    #[inline(always)]
     fn poll_tick(
         &mut self,
         tick: u64,
         now: Instant,
         ctx: &mut T::Context,
         fired: &mut usize,
-        lost: &mut usize,
+        mut failover: impl FnMut(u64, T),
     ) where
         T: Timer,
     {
@@ -262,7 +280,9 @@ impl<
             }
 
             let slot = self.slot_for_tick(gear_idx, tick);
-            self.drain_and_fire(gear_idx, slot, now, ctx, fired, lost);
+            self.drain_and_fire(gear_idx, slot, now, ctx, fired, |when, timer| {
+                failover(when, timer)
+            });
         }
     }
 
@@ -274,7 +294,7 @@ impl<
         now: Instant,
         ctx: &mut T::Context,
         fired: &mut usize,
-        lost: &mut usize,
+        mut failover: impl FnMut(u64, T),
     ) where
         T: Timer,
     {
@@ -293,11 +313,11 @@ impl<
             *fired += 1;
 
             if let Some(next_when) = timer.fire(now, ctx) {
-                if self
-                    .insert_excluding(next_when, timer, gear_idx, slot)
-                    .is_err()
+                let when_tick = self.instant_to_tick(next_when);
+                if let Err(InsertError(timer)) =
+                    self.insert_excluding(when_tick, timer, gear_idx, slot)
                 {
-                    *lost += 1;
+                    failover(when_tick, timer);
                 }
             }
         }
@@ -306,12 +326,11 @@ impl<
     #[inline(always)]
     fn insert_excluding(
         &mut self,
-        when: Instant,
+        when_tick: u64,
         timer: T,
         excluded_gear: usize,
         excluded_slot: usize,
     ) -> Result<TimerHandle, InsertError<T>> {
-        let when_tick = self.instant_to_tick(when);
         let delay = when_tick.saturating_sub(self.current_tick).max(1);
 
         let gear_idx = self.gear_for_delay(delay);

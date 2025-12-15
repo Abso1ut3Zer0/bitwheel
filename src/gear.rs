@@ -8,10 +8,6 @@ pub const NUM_SLOTS: usize = 64;
 pub const SLOT_MASK: usize = 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("slot is full")]
-pub struct SlotFull;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("no available slot")]
 pub struct NoAvailableSlot;
 

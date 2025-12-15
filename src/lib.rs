@@ -5,6 +5,7 @@ mod wheel;
 
 use std::time::Instant;
 
+pub use failover::*;
 pub use wheel::*;
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
