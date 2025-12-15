@@ -10,7 +10,7 @@ use std::time::Instant;
 pub use failover::*;
 pub use wheel::*;
 
-use crate::gear::InsertError;
+pub use crate::gear::InsertError;
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("{0} timers failed to reschedule")]
