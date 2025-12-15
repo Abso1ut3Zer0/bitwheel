@@ -1999,4 +1999,56 @@ mod latency_tests {
         print_histogram("Realistic Trading - Poll", &poll_hist);
         print_histogram("Realistic Trading - Cancel (order fill)", &cancel_hist);
     }
+
+    #[test]
+    #[ignore]
+    fn hdr_interleaved_insert_standard() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+        let mut now = epoch;
+
+        // Pre-populate: timers at regular intervals (every 10ms from 100-10000ms)
+        for i in 0..10_000 {
+            let when = epoch + Duration::from_millis(100 + i * 10);
+            let _ = wheel.insert(when, LatencyTimer);
+        }
+
+        // Warmup - insert timers that land BETWEEN existing entries
+        for i in 0..WARMUP {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            let base = 100 + ((i % 990) * 10);
+            let when = epoch + Duration::from_millis(base + 5);
+            let _ = wheel.insert(when, LatencyTimer);
+        }
+
+        // Measure - every insert lands between two existing timers
+        for i in 0..ITERATIONS {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            // Replenish the "grid" timers as they fire
+            if i % 10 == 0 {
+                let when = now + Duration::from_millis(10000);
+                let _ = wheel.insert(when, LatencyTimer);
+            }
+
+            // The measured insert: always between existing entries
+            let base = ((now.duration_since(epoch).as_millis() as u64) % 9900) + 100;
+            let offset = (i % 3) * 2 + 3; // 3, 5, or 7
+            let when = epoch + Duration::from_millis(base + offset);
+
+            let start = Instant::now();
+            let _ = wheel.insert(when, LatencyTimer);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Interleaved Insert", &hist);
+    }
 }
