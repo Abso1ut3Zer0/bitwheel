@@ -9,6 +9,7 @@ A high-performance hierarchical timer wheel for Rust, optimized for consistent l
 - **Zero allocation on hot path** — all memory pre-allocated; trades memory for determinism
 - **Bounded capacity by design** — insert failure signals backpressure, not a bug
 - **Failover option** — `BitWheelWithFailover` gracefully degrades to BTreeMap when full
+- **Dual-lane option** — `DualBitWheel` separates periodic and oneshot timers with independent configurations
 - **Precision tradeoff** — coarser gears sacrifice millisecond precision (does a 1-hour timer need it?)
 - **Compile-time configuration** — tune resolution, capacity, and range via const generics
 
@@ -70,6 +71,27 @@ let mut precise: Box<PreciseWheel<MyTimer>> = PreciseWheel::boxed();
 
 // High capacity with safety net
 let mut burst: Box<BurstWheelWithFailover<MyTimer>> = BurstWheelWithFailover::boxed();
+```
+
+### Dual-Lane Wheels
+
+`DualBitWheel` runs two independent wheels — one for periodic timers (heartbeats, monitoring) and one for oneshot timers (order timeouts). Each lane has its own resolution and capacity tuning.
+
+| Type | Periodic | Oneshot | Use Case |
+|------|----------|---------|----------|
+| `StandardBalancedDualWheel` | 100ms / 8 cap | 5ms / 16 cap | General purpose |
+| `FastPreciseDualWheel` | 100ms / 16 cap | 1ms / 64 cap | HFT order timeouts |
+| `StandardBurstDualWheel` | 100ms / 8 cap | 5ms / 32 cap | Bursty workloads |
+```rust
+use bitwheel::{StandardBalancedDualWheel, DualBitWheel};
+
+let mut wheel: Box<StandardBalancedDualWheel<MyTimer>> = DualBitWheel::boxed();
+
+// Periodic timers (heartbeats) — coarse resolution, high probe tolerance
+let handle = wheel.insert_periodic(when, timer);
+
+// Oneshot timers (order timeouts) — fine resolution, tight latency
+let handle = wheel.insert_oneshot(when, timer);
 ```
 
 ## Design Philosophy
@@ -141,26 +163,26 @@ Measured with HDR histograms (100k warmup, 1M iterations, `--release`).
 
 Timers inserted between existing entries — stresses tree rebalancing and cascading.
 
-| Percentile | BitWheel | BitWheel+Failover | BTreeMap | HHWT |
-|------------|----------|-------------------|----------|------|
-| p50 | **26 ns** | 27 ns | 34 ns | 39 ns |
-| p90 | **28 ns** | 31 ns | 49 ns | 54 ns |
-| p99 | **34 ns** | 50 ns | 100 ns | 278 ns |
-| p99.9 | **48 ns** | 75 ns | 131 ns | 990 ns |
-| p99.99 | **209 ns** | 209 ns | 365 ns | 2757 ns |
+| Percentile | BitWheel | BitWheel+Failover | DualBitWheel | BTreeMap | HHWT |
+|------------|----------|-------------------|--------------|----------|------|
+| p50 | **26 ns** | 27 ns | 26 ns | 34 ns | 39 ns |
+| p90 | **28 ns** | 31 ns | 29 ns | 49 ns | 54 ns |
+| p99 | **34 ns** | 50 ns | 39 ns | 100 ns | 278 ns |
+| p99.9 | **48 ns** | 75 ns | 67 ns | 131 ns | 990 ns |
+| p99.99 | **131 ns** | 149 ns | 145 ns | 201 ns | 2415 ns |
 
 ### Realistic Trading Simulation
 
 Order timeout management: 80% inserts, 5% cancels, continuous polling.
 
-| Operation | BitWheel | BitWheel+Failover | BTreeMap | HHWT |
-|-----------|----------|-------------------|----------|------|
-| Insert p50 | **26 ns** | 27 ns | 42 ns | 28 ns |
-| Insert p99.9 | **61 ns** | 66 ns | 79 ns | 87 ns |
-| Poll p50 | **15 ns** | 17 ns | 17 ns | 19 ns |
-| Poll p99.9 | **61 ns** | 65 ns | 149 ns | 1515 ns |
-| Cancel p50 | **14 ns** | 14 ns | 54 ns | 20 ns |
-| Cancel p99.9 | **33 ns** | 36 ns | 156 ns | 45 ns |
+| Operation | BitWheel | BitWheel+Failover | DualBitWheel | BTreeMap | HHWT |
+|-----------|----------|-------------------|--------------|----------|------|
+| Insert p50 | **26 ns** | 27 ns | 26 ns | 42 ns | 28 ns |
+| Insert p99.9 | **61 ns** | 66 ns | 66 ns | 79 ns | 87 ns |
+| Poll p50 | **15 ns** | 17 ns | 19 ns | 17 ns | 19 ns |
+| Poll p99.9 | **61 ns** | 65 ns | 67 ns | 149 ns | 1515 ns |
+| Cancel p50 | **14 ns** | 14 ns | 14 ns | 54 ns | 20 ns |
+| Cancel p99.9 | **33 ns** | 36 ns | 37 ns | 156 ns | 45 ns |
 
 ### Summary
 

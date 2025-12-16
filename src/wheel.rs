@@ -447,14 +447,6 @@ impl<
     }
 }
 
-#[macro_export]
-macro_rules! define_bitwheel {
-    ($name:ident, $timer:ty, $num_gears:expr, $resolution_ms:expr, $slot_cap:expr, $max_probes:expr) => {
-        pub type $name =
-            $crate::BitWheel<$timer, $num_gears, $resolution_ms, $slot_cap, $max_probes>;
-    };
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

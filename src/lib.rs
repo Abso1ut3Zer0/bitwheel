@@ -1,3 +1,4 @@
+mod dual;
 mod failover;
 mod gear;
 mod slot;
@@ -7,6 +8,7 @@ mod comparisons;
 
 use std::time::Instant;
 
+pub use dual::*;
 pub use failover::*;
 pub use wheel::*;
 
@@ -248,3 +250,199 @@ pub type ExtendedFastWheelWithFailover<T> = BitWheelWithFailover<T, 4, 16, 64, 2
 /// Compact extended with failover. 16ms resolution, ~3 days.
 /// Hotspot: 128. Memory: ~100KB. Failover check: 368ms.
 pub type ExtendedLightWheelWithFailover<T> = BitWheelWithFailover<T, 4, 16, 8, 16, 23>;
+
+// ============================================================
+// PERIODIC WHEELS - Bounded population, full gear probing
+// All use MAX_PROBES = 64 (full gear scan)
+// ============================================================
+
+// FAST PERIODIC - For high-frequency sampling (25-100ms periods)
+// 25ms resolution, 2 gears → ~1.7 min range
+pub type FastPeriodicWheel<T> = BitWheel<T, 2, 25, 8, 64>;
+
+// STANDARD PERIODIC - For heartbeats (1-30s periods)
+// 100ms resolution, 2 gears → ~7 min range
+pub type StandardPeriodicWheel<T> = BitWheel<T, 2, 100, 8, 64>;
+
+// RELAXED PERIODIC - For slow checks (1-5 min periods)
+// 500ms resolution, 2 gears → ~34 min range
+pub type RelaxedPeriodicWheel<T> = BitWheel<T, 2, 500, 8, 64>;
+
+// EXTENDED PERIODIC - For very slow periodics (5+ min periods)
+// 1s resolution, 2 gears → ~68 min range
+pub type ExtendedPeriodicWheel<T> = BitWheel<T, 2, 1000, 8, 64>;
+
+// ============================================================
+// DUAL WHEELS - Periodic + Oneshot combinations
+// Naming: {Periodic}{Oneshot}DualWheel
+// ============================================================
+
+// ------------------------------------------------------------
+// FAST PERIODIC (25ms) + BALANCED ONESHOT (5ms, general purpose)
+// ------------------------------------------------------------
+
+/// Fast periodic + Balanced oneshot.
+/// Periodic: 25ms res, ~1.7 min. Oneshot: 5ms res, ~23 hrs.
+pub type FastBalancedDualWheel<T> = DualBitWheel<T, 2, 25, 8, 4, 5, 16, 8>;
+
+/// Fast periodic + Balanced Fast oneshot.
+pub type FastBalancedFastDualWheel<T> = DualBitWheel<T, 2, 25, 8, 4, 5, 64, 2>;
+
+/// Fast periodic + Balanced Light oneshot.
+pub type FastBalancedLightDualWheel<T> = DualBitWheel<T, 2, 25, 8, 4, 5, 8, 16>;
+
+// ------------------------------------------------------------
+// FAST PERIODIC (25ms) + PRECISE ONESHOT (1ms, fine timing)
+// ------------------------------------------------------------
+
+/// Fast periodic + Precise oneshot.
+/// Periodic: 25ms res, ~1.7 min. Oneshot: 1ms res, ~4.7 hrs.
+pub type FastPreciseDualWheel<T> = DualBitWheel<T, 2, 25, 8, 4, 1, 16, 8>;
+
+/// Fast periodic + Precise Fast oneshot.
+pub type FastPreciseFastDualWheel<T> = DualBitWheel<T, 2, 25, 8, 4, 1, 64, 2>;
+
+/// Fast periodic + Precise Light oneshot.
+pub type FastPreciseLightDualWheel<T> = DualBitWheel<T, 2, 25, 8, 4, 1, 8, 16>;
+
+// ------------------------------------------------------------
+// FAST PERIODIC (25ms) + BURST ONESHOT (5ms, high volume)
+// ------------------------------------------------------------
+
+/// Fast periodic + Burst oneshot.
+/// Periodic: 25ms res, ~1.7 min. Oneshot: 5ms res, ~23 hrs, 2x hotspot.
+pub type FastBurstDualWheel<T> = DualBitWheel<T, 2, 25, 8, 4, 5, 32, 8>;
+
+/// Fast periodic + Burst Fast oneshot.
+pub type FastBurstFastDualWheel<T> = DualBitWheel<T, 2, 25, 8, 4, 5, 128, 2>;
+
+/// Fast periodic + Burst Light oneshot.
+pub type FastBurstLightDualWheel<T> = DualBitWheel<T, 2, 25, 8, 4, 5, 16, 16>;
+
+// ------------------------------------------------------------
+// STANDARD PERIODIC (100ms) + BALANCED ONESHOT
+// ------------------------------------------------------------
+
+/// Standard periodic + Balanced oneshot.
+/// Periodic: 100ms res, ~7 min. Oneshot: 5ms res, ~23 hrs.
+pub type StandardBalancedDualWheel<T> = DualBitWheel<T, 2, 100, 8, 4, 5, 16, 8>;
+
+/// Standard periodic + Balanced Fast oneshot.
+pub type StandardBalancedFastDualWheel<T> = DualBitWheel<T, 2, 100, 8, 4, 5, 64, 2>;
+
+/// Standard periodic + Balanced Light oneshot.
+pub type StandardBalancedLightDualWheel<T> = DualBitWheel<T, 2, 100, 8, 4, 5, 8, 16>;
+
+// ------------------------------------------------------------
+// STANDARD PERIODIC (100ms) + PRECISE ONESHOT
+// ------------------------------------------------------------
+
+/// Standard periodic + Precise oneshot.
+/// Periodic: 100ms res, ~7 min. Oneshot: 1ms res, ~4.7 hrs.
+pub type StandardPreciseDualWheel<T> = DualBitWheel<T, 2, 100, 8, 4, 1, 16, 8>;
+
+/// Standard periodic + Precise Fast oneshot.
+pub type StandardPreciseFastDualWheel<T> = DualBitWheel<T, 2, 100, 8, 4, 1, 64, 2>;
+
+/// Standard periodic + Precise Light oneshot.
+pub type StandardPreciseLightDualWheel<T> = DualBitWheel<T, 2, 100, 8, 4, 1, 8, 16>;
+
+// ------------------------------------------------------------
+// STANDARD PERIODIC (100ms) + BURST ONESHOT
+// ------------------------------------------------------------
+
+/// Standard periodic + Burst oneshot.
+/// Periodic: 100ms res, ~7 min. Oneshot: 5ms res, ~23 hrs, 2x hotspot.
+pub type StandardBurstDualWheel<T> = DualBitWheel<T, 2, 100, 8, 4, 5, 32, 8>;
+
+/// Standard periodic + Burst Fast oneshot.
+pub type StandardBurstFastDualWheel<T> = DualBitWheel<T, 2, 100, 8, 4, 5, 128, 2>;
+
+/// Standard periodic + Burst Light oneshot.
+pub type StandardBurstLightDualWheel<T> = DualBitWheel<T, 2, 100, 8, 4, 5, 16, 16>;
+
+// ------------------------------------------------------------
+// RELAXED PERIODIC (500ms) + BALANCED ONESHOT
+// ------------------------------------------------------------
+
+/// Relaxed periodic + Balanced oneshot.
+/// Periodic: 500ms res, ~34 min. Oneshot: 5ms res, ~23 hrs.
+pub type RelaxedBalancedDualWheel<T> = DualBitWheel<T, 2, 500, 8, 4, 5, 16, 8>;
+
+/// Relaxed periodic + Balanced Fast oneshot.
+pub type RelaxedBalancedFastDualWheel<T> = DualBitWheel<T, 2, 500, 8, 4, 5, 64, 2>;
+
+/// Relaxed periodic + Balanced Light oneshot.
+pub type RelaxedBalancedLightDualWheel<T> = DualBitWheel<T, 2, 500, 8, 4, 5, 8, 16>;
+
+// ------------------------------------------------------------
+// RELAXED PERIODIC (500ms) + PRECISE ONESHOT
+// ------------------------------------------------------------
+
+/// Relaxed periodic + Precise oneshot.
+/// Periodic: 500ms res, ~34 min. Oneshot: 1ms res, ~4.7 hrs.
+pub type RelaxedPreciseDualWheel<T> = DualBitWheel<T, 2, 500, 8, 4, 1, 16, 8>;
+
+/// Relaxed periodic + Precise Fast oneshot.
+pub type RelaxedPreciseFastDualWheel<T> = DualBitWheel<T, 2, 500, 8, 4, 1, 64, 2>;
+
+/// Relaxed periodic + Precise Light oneshot.
+pub type RelaxedPreciseLightDualWheel<T> = DualBitWheel<T, 2, 500, 8, 4, 1, 8, 16>;
+
+// ------------------------------------------------------------
+// RELAXED PERIODIC (500ms) + BURST ONESHOT
+// ------------------------------------------------------------
+
+/// Relaxed periodic + Burst oneshot.
+/// Periodic: 500ms res, ~34 min. Oneshot: 5ms res, ~23 hrs, 2x hotspot.
+pub type RelaxedBurstDualWheel<T> = DualBitWheel<T, 2, 500, 8, 4, 5, 32, 8>;
+
+/// Relaxed periodic + Burst Fast oneshot.
+pub type RelaxedBurstFastDualWheel<T> = DualBitWheel<T, 2, 500, 8, 4, 5, 128, 2>;
+
+/// Relaxed periodic + Burst Light oneshot.
+pub type RelaxedBurstLightDualWheel<T> = DualBitWheel<T, 2, 500, 8, 4, 5, 16, 16>;
+
+// ------------------------------------------------------------
+// EXTENDED PERIODIC (1s) + EXTENDED ONESHOT (16ms, long duration)
+// ------------------------------------------------------------
+
+/// Extended periodic + Extended oneshot.
+/// Periodic: 1s res, ~68 min. Oneshot: 16ms res, ~3 days.
+pub type ExtendedDualWheel<T> = DualBitWheel<T, 2, 1000, 8, 4, 16, 16, 8>;
+
+/// Extended periodic + Extended Fast oneshot.
+pub type ExtendedFastDualWheel<T> = DualBitWheel<T, 2, 1000, 8, 4, 16, 64, 2>;
+
+/// Extended periodic + Extended Light oneshot.
+pub type ExtendedLightDualWheel<T> = DualBitWheel<T, 2, 1000, 8, 4, 16, 8, 16>;
+
+#[macro_export]
+macro_rules! define_bitwheel {
+    ($name:ident, $timer:ty, $num_gears:expr, $resolution_ms:expr, $slot_cap:expr, $max_probes:expr) => {
+        pub type $name =
+            $crate::BitWheel<$timer, $num_gears, $resolution_ms, $slot_cap, $max_probes>;
+    };
+}
+
+/// Convenience macro for defining custom dual wheel configurations.
+#[macro_export]
+macro_rules! define_dual_bitwheel {
+    (
+        $name:ident,
+        $timer:ty,
+        periodic: { gears: $p_gears:expr, resolution_ms: $p_res:expr, slot_cap: $p_cap:expr },
+        oneshot: { gears: $o_gears:expr, resolution_ms: $o_res:expr, slot_cap: $o_cap:expr, max_probes: $o_probes:expr }
+    ) => {
+        pub type $name = $crate::DualBitWheel<
+            $timer,
+            $p_gears,
+            $p_res,
+            $p_cap,
+            $o_gears,
+            $o_res,
+            $o_cap,
+            $o_probes,
+        >;
+    };
+}
