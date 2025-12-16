@@ -875,3 +875,840 @@ mod tests {
         assert_eq!(drop_count.load(Ordering::SeqCst), 10);
     }
 }
+
+#[cfg(test)]
+mod latency_tests {
+    use crate::{DualBitWheel, StandardBalancedDualWheel, StandardBurstDualWheel, Timer};
+
+    use hdrhistogram::Histogram;
+    use std::time::{Duration, Instant};
+
+    const WARMUP: u64 = 100_000;
+    const ITERATIONS: u64 = 1_000_000;
+
+    struct LatencyTimer;
+
+    impl Timer for LatencyTimer {
+        type Context = ();
+
+        fn fire(&mut self, _now: Instant, _ctx: &mut ()) -> Option<Instant> {
+            None
+        }
+    }
+
+    struct PeriodicLatencyTimer {
+        period: Duration,
+        remaining: usize,
+    }
+
+    impl Timer for PeriodicLatencyTimer {
+        type Context = ();
+
+        fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
+            self.remaining = self.remaining.saturating_sub(1);
+            if self.remaining > 0 {
+                Some(now + self.period)
+            } else {
+                None
+            }
+        }
+    }
+
+    enum MixedLatencyTimer {
+        OneShot,
+        Periodic { period: Duration, remaining: usize },
+    }
+
+    impl Timer for MixedLatencyTimer {
+        type Context = ();
+
+        fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
+            match self {
+                MixedLatencyTimer::OneShot => None,
+                MixedLatencyTimer::Periodic { period, remaining } => {
+                    *remaining = remaining.saturating_sub(1);
+                    if *remaining > 0 {
+                        Some(now + *period)
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn print_histogram(name: &str, hist: &Histogram<u64>) {
+        println!("\n=== {} ===", name);
+        println!("  count:  {}", hist.len());
+        println!("  min:    {} ns", hist.min());
+        println!("  max:    {} ns", hist.max());
+        println!("  mean:   {:.1} ns", hist.mean());
+        println!("  stddev: {:.1} ns", hist.stdev());
+        println!("  p50:    {} ns", hist.value_at_quantile(0.50));
+        println!("  p90:    {} ns", hist.value_at_quantile(0.90));
+        println!("  p99:    {} ns", hist.value_at_quantile(0.99));
+        println!("  p99.9:  {} ns", hist.value_at_quantile(0.999));
+        println!("  p99.99: {} ns", hist.value_at_quantile(0.9999));
+    }
+
+    // ==================== Insert Latency ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_insert_oneshot_latency_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let when = epoch + Duration::from_millis((i % 500) + 10);
+            let handle = wheel.insert_oneshot(when, LatencyTimer).unwrap();
+            wheel.cancel(handle);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let when = epoch + Duration::from_millis((i % 500) + 10);
+
+            let start = Instant::now();
+            let handle = wheel.insert_oneshot(when, LatencyTimer).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+            wheel.cancel(handle);
+        }
+
+        print_histogram("Dual - Insert Oneshot Latency", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_insert_periodic_latency_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let when = epoch + Duration::from_millis((i % 5000) + 500);
+            let handle = wheel.insert_periodic(when, LatencyTimer).unwrap();
+            wheel.cancel(handle);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let when = epoch + Duration::from_millis((i % 5000) + 500);
+
+            let start = Instant::now();
+            let handle = wheel.insert_periodic(when, LatencyTimer).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+            wheel.cancel(handle);
+        }
+
+        print_histogram("Dual - Insert Periodic Latency", &hist);
+    }
+
+    // ==================== Cancel Latency ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_cancel_oneshot_latency_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let when = epoch + Duration::from_millis((i % 500) + 10);
+            let handle = wheel.insert_oneshot(when, LatencyTimer).unwrap();
+            wheel.cancel(handle);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let when = epoch + Duration::from_millis((i % 500) + 10);
+            let handle = wheel.insert_oneshot(when, LatencyTimer).unwrap();
+
+            let start = Instant::now();
+            let _ = wheel.cancel(handle);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Dual - Cancel Oneshot Latency", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_cancel_periodic_latency_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let when = epoch + Duration::from_millis((i % 5000) + 500);
+            let handle = wheel.insert_periodic(when, LatencyTimer).unwrap();
+            wheel.cancel(handle);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let when = epoch + Duration::from_millis((i % 5000) + 500);
+            let handle = wheel.insert_periodic(when, LatencyTimer).unwrap();
+
+            let start = Instant::now();
+            let _ = wheel.cancel(handle);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Dual - Cancel Periodic Latency", &hist);
+    }
+
+    // ==================== Poll Latency ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_empty_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let now = epoch + Duration::from_millis(i);
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in WARMUP..(WARMUP + ITERATIONS) {
+            let now = epoch + Duration::from_millis(i);
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Dual - Poll Empty", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_pending_no_fires_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        // Insert timers far in future - both wheels
+        for i in 0..500 {
+            let when = epoch + Duration::from_millis(100_000_000 + i);
+            let _ = wheel.insert_oneshot(when, LatencyTimer);
+        }
+        for i in 0..50 {
+            let when = epoch + Duration::from_millis(100_000_000 + i * 1000);
+            let _ = wheel.insert_periodic(when, LatencyTimer);
+        }
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let now = epoch + Duration::from_millis(i);
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in WARMUP..(WARMUP + ITERATIONS) {
+            let now = epoch + Duration::from_millis(i);
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Dual - Poll Pending (No Fires)", &hist);
+    }
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_single_oneshot_fire_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let when = epoch + Duration::from_millis(i + 1);
+            let _ = wheel.insert_oneshot(when, LatencyTimer);
+            let now = epoch + Duration::from_millis(i + 1);
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let tick = WARMUP + i;
+            let when = epoch + Duration::from_millis(tick + 1);
+            let _ = wheel.insert_oneshot(when, LatencyTimer);
+
+            let now = epoch + Duration::from_millis(tick + 1);
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Dual - Poll Single Oneshot Fire", &hist);
+    }
+
+    // ==================== Periodic Steady State ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_periodic_steady_state_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<PeriodicLatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // 10 periodic timers in periodic wheel, 100ms period (matches periodic resolution)
+        for i in 0..10 {
+            let when = epoch + Duration::from_millis(100 + i * 10);
+            let timer = PeriodicLatencyTimer {
+                period: Duration::from_millis(100),
+                remaining: usize::MAX,
+            };
+            let _ = wheel.insert_periodic(when, timer);
+        }
+
+        // Warmup
+        for i in 0..WARMUP {
+            let now = epoch + Duration::from_millis(i + 1);
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in WARMUP..(WARMUP + ITERATIONS) {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Dual - Periodic Steady State (10 timers @ 100ms)", &hist);
+    }
+
+    // ==================== Mixed Workload ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_mixed_periodic_oneshot_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<MixedLatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // 10 periodic heartbeats in periodic wheel, 500ms period
+        for i in 0..10 {
+            let when = epoch + Duration::from_millis(500 + i * 50);
+            let timer = MixedLatencyTimer::Periodic {
+                period: Duration::from_millis(500),
+                remaining: usize::MAX,
+            };
+            let _ = wheel.insert_periodic(when, timer);
+        }
+
+        // Warmup
+        for i in 0..WARMUP {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            // Insert 2 one-shot timers per tick (order timeouts) in oneshot wheel
+            for j in 0..2 {
+                let when = now + Duration::from_millis(50 + (i + j) % 50);
+                let _ = wheel.insert_oneshot(when, MixedLatencyTimer::OneShot);
+            }
+
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in WARMUP..(WARMUP + ITERATIONS) {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            // Insert 2 one-shot timers per tick
+            for j in 0..2 {
+                let when = now + Duration::from_millis(50 + (i + j) % 50);
+                let _ = wheel.insert_oneshot(when, MixedLatencyTimer::OneShot);
+            }
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Dual - Mixed (10 periodic + 2 oneshot/tick)", &hist);
+    }
+
+    // ==================== Bursty Workload ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_bursty_workload_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBurstDualWheel<MixedLatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // 10 periodic heartbeats, 500ms period
+        for i in 0..10 {
+            let when = epoch + Duration::from_millis(500 + i * 50);
+            let timer = MixedLatencyTimer::Periodic {
+                period: Duration::from_millis(500),
+                remaining: usize::MAX,
+            };
+            let _ = wheel.insert_periodic(when, timer);
+        }
+
+        // Warmup
+        for i in 0..WARMUP {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            // Burst every 100 ticks
+            if i % 100 == 0 {
+                for j in 0..50 {
+                    let when = now + Duration::from_millis(20 + j % 80);
+                    let _ = wheel.insert_oneshot(when, MixedLatencyTimer::OneShot);
+                }
+            }
+
+            let _ = wheel.poll(now, &mut ctx);
+        }
+
+        // Measure
+        for i in WARMUP..(WARMUP + ITERATIONS) {
+            let now = epoch + Duration::from_millis(i + 1);
+
+            // Burst every 100 ticks
+            if i % 100 == 0 {
+                for j in 0..50 {
+                    let when = now + Duration::from_millis(20 + j % 80);
+                    let _ = wheel.insert_oneshot(when, MixedLatencyTimer::OneShot);
+                }
+            }
+
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Dual - Bursty (10 periodic + 50 burst every 100ms)", &hist);
+    }
+
+    // ==================== Trading Simulation ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_trading_simulation_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut insert_hist = Histogram::<u64>::new(3).unwrap();
+        let mut poll_hist = Histogram::<u64>::new(3).unwrap();
+        let mut cancel_hist = Histogram::<u64>::new(3).unwrap();
+
+        let mut handles = Vec::with_capacity(100);
+        let mut ctx = ();
+        let mut now = epoch;
+
+        // Warmup
+        for i in 0..WARMUP {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            if i % 5 != 0 {
+                let when = now + Duration::from_millis(50 + (i % 200));
+                if let Ok(handle) = wheel.insert_oneshot(when, LatencyTimer) {
+                    if handles.len() < 100 {
+                        handles.push(handle);
+                    }
+                }
+            }
+
+            if i % 20 == 0 {
+                if let Some(handle) = handles.pop() {
+                    let _ = wheel.cancel(handle);
+                }
+            }
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            now += Duration::from_millis(1);
+
+            // Poll
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
+
+            // Insert 80%
+            if i % 5 != 0 {
+                let when = now + Duration::from_millis(50 + (i % 200));
+
+                let start = Instant::now();
+                if let Ok(handle) = wheel.insert_oneshot(when, LatencyTimer) {
+                    insert_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+
+                    if handles.len() < 100 {
+                        handles.push(handle);
+                    }
+                }
+            }
+
+            // Cancel 5%
+            if i % 20 == 0 {
+                if let Some(handle) = handles.pop() {
+                    let start = Instant::now();
+                    let _ = wheel.cancel(handle);
+                    cancel_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+                }
+            }
+        }
+
+        print_histogram("Dual Trading Sim - Insert", &insert_hist);
+        print_histogram("Dual Trading Sim - Poll", &poll_hist);
+        print_histogram("Dual Trading Sim - Cancel", &cancel_hist);
+    }
+
+    // ==================== Realistic Trading ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_realistic_trading_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<MixedLatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut insert_hist = Histogram::<u64>::new(3).unwrap();
+        let mut poll_hist = Histogram::<u64>::new(3).unwrap();
+        let mut cancel_hist = Histogram::<u64>::new(3).unwrap();
+
+        let mut handles = Vec::with_capacity(100);
+        let mut ctx = ();
+        let mut now = epoch;
+
+        // Background: 5 venue heartbeats @ 30s period in PERIODIC wheel
+        for i in 0..5 {
+            let when = epoch + Duration::from_secs(30) + Duration::from_millis(i * 100);
+            let timer = MixedLatencyTimer::Periodic {
+                period: Duration::from_secs(30),
+                remaining: usize::MAX,
+            };
+            let _ = wheel.insert_periodic(when, timer);
+        }
+
+        // Warmup
+        for i in 0..WARMUP {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            // 80% of ticks: new order timeout (50-250ms) in ONESHOT wheel
+            if i % 5 != 0 {
+                let when = now + Duration::from_millis(50 + (i % 200));
+                if let Ok(handle) = wheel.insert_oneshot(when, MixedLatencyTimer::OneShot) {
+                    if handles.len() < 100 {
+                        handles.push(handle);
+                    }
+                }
+            }
+
+            // 5% of ticks: order filled, cancel timeout
+            if i % 20 == 0 {
+                if let Some(handle) = handles.pop() {
+                    let _ = wheel.cancel(handle);
+                }
+            }
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            now += Duration::from_millis(1);
+
+            // Poll (always)
+            let start = Instant::now();
+            let _ = wheel.poll(now, &mut ctx);
+            poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
+
+            // Insert order timeout 80%
+            if i % 5 != 0 {
+                let when = now + Duration::from_millis(50 + (i % 200));
+
+                let start = Instant::now();
+                if let Ok(handle) = wheel.insert_oneshot(when, MixedLatencyTimer::OneShot) {
+                    insert_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+
+                    if handles.len() < 100 {
+                        handles.push(handle);
+                    }
+                }
+            }
+
+            // Cancel 5% (order filled)
+            if i % 20 == 0 {
+                if let Some(handle) = handles.pop() {
+                    let start = Instant::now();
+                    let _ = wheel.cancel(handle);
+                    cancel_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+                }
+            }
+        }
+
+        print_histogram(
+            "Dual Realistic Trading - Insert (order timeout)",
+            &insert_hist,
+        );
+        print_histogram("Dual Realistic Trading - Poll", &poll_hist);
+        print_histogram("Dual Realistic Trading - Cancel (order fill)", &cancel_hist);
+    }
+
+    // ==================== Interleaved Insert ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_interleaved_insert_dual() {
+        let epoch = Instant::now();
+        let mut wheel: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+        let mut now = epoch;
+
+        // Pre-populate oneshot wheel: timers at regular intervals (every 10ms from 100-10000ms)
+        for i in 0..10_000 {
+            let when = epoch + Duration::from_millis(100 + i * 10);
+            let _ = wheel.insert_oneshot(when, LatencyTimer);
+        }
+
+        // Warmup - insert timers that land BETWEEN existing entries
+        for i in 0..WARMUP {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            let base = 100 + ((i % 990) * 10);
+            let when = epoch + Duration::from_millis(base + 5);
+            let _ = wheel.insert_oneshot(when, LatencyTimer);
+        }
+
+        // Measure - every insert lands between two existing timers
+        for i in 0..ITERATIONS {
+            now += Duration::from_millis(1);
+            let _ = wheel.poll(now, &mut ctx);
+
+            // Replenish the "grid" timers as they fire
+            if i % 10 == 0 {
+                let when = now + Duration::from_millis(10000);
+                let _ = wheel.insert_oneshot(when, LatencyTimer);
+            }
+
+            // The measured insert: always between existing entries
+            let base = ((now.duration_since(epoch).as_millis() as u64) % 9900) + 100;
+            let offset = (i % 3) * 2 + 3; // 3, 5, or 7
+            let when = epoch + Duration::from_millis(base + offset);
+
+            let start = Instant::now();
+            let _ = wheel.insert_oneshot(when, LatencyTimer);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Dual - Interleaved Insert", &hist);
+    }
+
+    // ==================== Comparison: Single vs Dual Poll ====================
+
+    /// Direct comparison: poll overhead when both wheels have timers but none fire
+    #[test]
+    #[ignore]
+    fn hdr_dual_vs_single_poll_overhead() {
+        let epoch = Instant::now();
+
+        // Setup dual wheel
+        let mut dual: Box<StandardBalancedDualWheel<LatencyTimer>> =
+            DualBitWheel::boxed_with_epoch(epoch);
+
+        // Setup single wheel (using the oneshot config which is BalancedWheel)
+        let mut single: Box<crate::BalancedWheel<LatencyTimer>> =
+            crate::BitWheel::boxed_with_epoch(epoch);
+
+        // Add background timers to both - far in future so they don't fire
+        for i in 0..100 {
+            let when = epoch + Duration::from_millis(100_000_000 + i);
+            let _ = dual.insert_oneshot(when, LatencyTimer);
+            let _ = single.insert(when, LatencyTimer);
+        }
+        for i in 0..10 {
+            let when = epoch + Duration::from_millis(100_000_000 + i * 10000);
+            let _ = dual.insert_periodic(when, LatencyTimer);
+        }
+
+        let mut dual_hist = Histogram::<u64>::new(3).unwrap();
+        let mut single_hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // Warmup both
+        for i in 0..WARMUP {
+            let now = epoch + Duration::from_millis(i);
+            let _ = dual.poll(now, &mut ctx);
+            let _ = single.poll(now, &mut ctx);
+        }
+
+        // Measure dual
+        for i in WARMUP..(WARMUP + ITERATIONS) {
+            let now = epoch + Duration::from_millis(i);
+
+            let start = Instant::now();
+            let _ = dual.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            dual_hist.record(elapsed).unwrap();
+        }
+
+        // Measure single
+        for i in WARMUP..(WARMUP + ITERATIONS) {
+            let now = epoch + Duration::from_millis(i);
+
+            let start = Instant::now();
+            let _ = single.poll(now, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            single_hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("COMPARISON - Single BitWheel Poll", &single_hist);
+        print_histogram("COMPARISON - Dual BitWheel Poll", &dual_hist);
+    }
+
+    /// Compare poll when timers ARE firing
+    #[test]
+    #[ignore]
+    fn hdr_dual_vs_single_poll_with_fires() {
+        let epoch = Instant::now();
+
+        let mut dual_hist = Histogram::<u64>::new(3).unwrap();
+        let mut single_hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+
+        // Test dual wheel
+        {
+            let mut dual: Box<StandardBalancedDualWheel<LatencyTimer>> =
+                DualBitWheel::boxed_with_epoch(epoch);
+
+            // Warmup
+            for i in 0..WARMUP {
+                let when = epoch + Duration::from_millis(i + 1);
+                let _ = dual.insert_oneshot(when, LatencyTimer);
+                let now = epoch + Duration::from_millis(i + 1);
+                let _ = dual.poll(now, &mut ctx);
+            }
+
+            // Measure
+            for i in 0..ITERATIONS {
+                let tick = WARMUP + i;
+                let when = epoch + Duration::from_millis(tick + 1);
+                let _ = dual.insert_oneshot(when, LatencyTimer);
+
+                let now = epoch + Duration::from_millis(tick + 1);
+
+                let start = Instant::now();
+                let _ = dual.poll(now, &mut ctx);
+                let elapsed = start.elapsed().as_nanos() as u64;
+
+                dual_hist.record(elapsed).unwrap();
+            }
+        }
+
+        // Test single wheel
+        {
+            let mut single: Box<crate::BalancedWheel<LatencyTimer>> =
+                crate::BitWheel::boxed_with_epoch(epoch);
+
+            // Warmup
+            for i in 0..WARMUP {
+                let when = epoch + Duration::from_millis(i + 1);
+                let _ = single.insert(when, LatencyTimer);
+                let now = epoch + Duration::from_millis(i + 1);
+                let _ = single.poll(now, &mut ctx);
+            }
+
+            // Measure
+            for i in 0..ITERATIONS {
+                let tick = WARMUP + i;
+                let when = epoch + Duration::from_millis(tick + 1);
+                let _ = single.insert(when, LatencyTimer);
+
+                let now = epoch + Duration::from_millis(tick + 1);
+
+                let start = Instant::now();
+                let _ = single.poll(now, &mut ctx);
+                let elapsed = start.elapsed().as_nanos() as u64;
+
+                single_hist.record(elapsed).unwrap();
+            }
+        }
+
+        print_histogram(
+            "COMPARISON - Single BitWheel Poll (with fires)",
+            &single_hist,
+        );
+        print_histogram("COMPARISON - Dual BitWheel Poll (with fires)", &dual_hist);
+    }
+}
