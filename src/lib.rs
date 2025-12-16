@@ -21,6 +21,12 @@ pub struct PollError(usize);
 pub trait Timer {
     type Context;
     fn fire(&mut self, now: Instant, ctx: &mut Self::Context) -> Option<Instant>;
+
+    /// Hint for dual-wheel routing. Override to return `true` for periodic timers.
+    #[inline(always)]
+    fn is_periodic(&self) -> bool {
+        false
+    }
 }
 
 /// Trait for timer driver implementations.
@@ -86,6 +92,39 @@ where
     #[inline(always)]
     fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> Result<usize, PollError> {
         Ok(BitWheelWithFailover::poll(self, now, ctx))
+    }
+}
+
+impl<
+    T,
+    const PG: usize,
+    const PR: u64,
+    const PS: usize,
+    const OG: usize,
+    const OR: u64,
+    const OS: usize,
+    const OP: usize,
+> TimerDriver<T> for DualBitWheel<T, PG, PR, PS, OG, OR, OS, OP>
+where
+    T: Timer,
+{
+    #[inline(always)]
+    fn insert(&mut self, when: Instant, timer: T) -> Result<TimerHandle, InsertError<T>> {
+        if timer.is_periodic() {
+            DualBitWheel::insert_periodic(self, when, timer)
+        } else {
+            DualBitWheel::insert_oneshot(self, when, timer)
+        }
+    }
+
+    #[inline(always)]
+    fn cancel(&mut self, handle: TimerHandle) -> Option<T> {
+        DualBitWheel::cancel(self, handle)
+    }
+
+    #[inline(always)]
+    fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> Result<usize, PollError> {
+        DualBitWheel::poll(self, now, ctx)
     }
 }
 
