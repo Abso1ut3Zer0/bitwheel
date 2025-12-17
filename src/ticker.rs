@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use heap::TickerHeap;
+pub use heap::{DEFAULT_TICKER_CAP, MIN_PERIOD, TickerHeap};
 
 pub type TickerHeap16<T> = TickerHeap<T, 16>;
 pub type TickerHeap32<T> = TickerHeap<T, 32>;
@@ -29,64 +29,83 @@ pub trait Ticker {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TickerHandle(pub(crate) usize);
+pub struct TickerHandle(pub(crate) u16);
 
 pub trait TickerDriver<T: Ticker> {
     fn insert(&mut self, ticker: T, now: Instant) -> Result<TickerHandle, InsertError<T>>;
     fn remove(&mut self, handle: TickerHandle) -> Option<T>;
-    fn cancel(&mut self, handle: TickerHandle) -> bool;
     fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize;
     fn peek_next_fire(&self) -> Option<Instant>;
     fn is_active(&self, handle: TickerHandle) -> bool;
     fn len(&self) -> usize;
-    fn is_empty(&self) -> bool;
+
+    fn cancel(&mut self, handle: TickerHandle) -> bool {
+        self.remove(handle).is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 mod heap {
     use super::*;
     use std::mem::MaybeUninit;
 
-    const MIN_PERIOD: Duration = Duration::from_millis(1);
-    const NONE: usize = usize::MAX;
+    pub const DEFAULT_TICKER_CAP: usize = 32;
+    pub const MIN_PERIOD: Duration = Duration::from_millis(1);
+    const NONE: u16 = u16::MAX;
 
     struct Entry<T> {
-        value: T,
+        ticker: T,
         fire_at: Instant,
     }
 
-    pub struct TickerHeap<T: Ticker, const CAP: usize = 16> {
+    /// Fixed-capacity min-heap for periodic tickers.
+    ///
+    /// Optimized for small n (16-128 tickers) with:
+    /// - u16 indices for cache-friendly heap operations
+    /// - Stable handles across reschedules
+    /// - O(1) peek, O(log n) insert/remove/poll
+    pub struct TickerHeap<T, const CAP: usize = DEFAULT_TICKER_CAP> {
         entries: [MaybeUninit<Entry<T>>; CAP],
-        free_stack: [usize; CAP],
-        free_len: usize,
-        heap: [usize; CAP],
-        heap_len: usize,
-        heap_pos: [usize; CAP],
+        free_stack: [u16; CAP],
+        free_len: u16,
+        heap: [u16; CAP],
+        heap_len: u16,
+        heap_pos: [u16; CAP],
     }
 
-    impl<T: Ticker, const CAP: usize> TickerHeap<T, CAP> {
+    impl<T, const CAP: usize> Default for TickerHeap<T, CAP> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl<T, const CAP: usize> TickerHeap<T, CAP> {
         pub fn new() -> Self {
             const {
-                assert!(CAP > 0, "CAP must be > 0");
+                assert!(CAP > 0, "capacity must be > 0");
+                assert!(CAP <= u16::MAX as usize - 1, "capacity must fit in u16");
             }
 
-            let mut free_stack = [0usize; CAP];
+            let mut free_stack = [0u16; CAP];
             for i in 0..CAP {
-                free_stack[i] = i;
+                free_stack[i] = i as u16;
             }
 
             Self {
                 entries: unsafe { MaybeUninit::uninit().assume_init() },
                 free_stack,
-                free_len: CAP,
-                heap: [0usize; CAP],
+                free_len: CAP as u16,
+                heap: [NONE; CAP],
                 heap_len: 0,
                 heap_pos: [NONE; CAP],
             }
         }
 
-        // === Heap operations ===
-
-        fn swim(&mut self, mut pos: usize) {
+        #[inline]
+        fn swim(&mut self, mut pos: u16) {
             while pos > 0 {
                 let parent = (pos - 1) / 2;
                 if self.compare(pos, parent).is_lt() {
@@ -98,7 +117,8 @@ mod heap {
             }
         }
 
-        fn sink(&mut self, mut pos: usize) {
+        #[inline]
+        fn sink(&mut self, mut pos: u16) {
             loop {
                 let left = 2 * pos + 1;
                 let right = 2 * pos + 2;
@@ -120,35 +140,23 @@ mod heap {
             }
         }
 
-        fn swap(&mut self, a: usize, b: usize) {
-            self.heap.swap(a, b);
-            self.heap_pos[self.heap[a]] = a;
-            self.heap_pos[self.heap[b]] = b;
+        #[inline]
+        fn swap(&mut self, a: u16, b: u16) {
+            let a_idx = a as usize;
+            let b_idx = b as usize;
+            self.heap.swap(a_idx, b_idx);
+            self.heap_pos[self.heap[a_idx] as usize] = a;
+            self.heap_pos[self.heap[b_idx] as usize] = b;
         }
 
-        fn compare(&self, a: usize, b: usize) -> std::cmp::Ordering {
-            let entry_a = self.heap[a];
-            let entry_b = self.heap[b];
+        #[inline]
+        fn compare(&self, a: u16, b: u16) -> std::cmp::Ordering {
+            let entry_a = self.heap[a as usize] as usize;
+            let entry_b = self.heap[b as usize] as usize;
             unsafe {
-                let fire_a = self.entries[entry_a].assume_init_ref().fire_at;
-                let fire_b = self.entries[entry_b].assume_init_ref().fire_at;
+                let fire_a = (*self.entries[entry_a].as_ptr()).fire_at;
+                let fire_b = (*self.entries[entry_b].as_ptr()).fire_at;
                 fire_a.cmp(&fire_b)
-            }
-        }
-    }
-
-    impl<T: Ticker, const CAP: usize> Default for TickerHeap<T, CAP> {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl<T: Ticker, const CAP: usize> Drop for TickerHeap<T, CAP> {
-        fn drop(&mut self) {
-            for i in 0..CAP {
-                if self.heap_pos[i] != NONE {
-                    unsafe { self.entries[i].assume_init_drop() };
-                }
             }
         }
     }
@@ -159,25 +167,21 @@ mod heap {
                 return Err(InsertError(ticker));
             }
 
-            // Allocate entry slot
             self.free_len -= 1;
-            let entry_idx = self.free_stack[self.free_len];
+            let entry_idx = self.free_stack[self.free_len as usize];
 
-            // Initialize entry
             let period = ticker.period().max(MIN_PERIOD);
-            let fire_at = now + period;
-            self.entries[entry_idx].write(Entry {
-                value: ticker,
-                fire_at,
-            });
+            let entry = Entry {
+                ticker,
+                fire_at: now + period,
+            };
+            self.entries[entry_idx as usize].write(entry);
 
-            // Add to heap
             let heap_pos = self.heap_len;
-            self.heap[heap_pos] = entry_idx;
-            self.heap_pos[entry_idx] = heap_pos;
+            self.heap[heap_pos as usize] = entry_idx;
+            self.heap_pos[entry_idx as usize] = heap_pos;
             self.heap_len += 1;
 
-            // Restore heap property
             self.swim(heap_pos);
 
             Ok(TickerHandle(entry_idx))
@@ -186,85 +190,84 @@ mod heap {
         fn remove(&mut self, handle: TickerHandle) -> Option<T> {
             let entry_idx = handle.0;
 
-            if entry_idx >= CAP || self.heap_pos[entry_idx] == NONE {
+            if entry_idx as usize >= CAP || self.heap_pos[entry_idx as usize] == NONE {
                 return None;
             }
 
-            let pos = self.heap_pos[entry_idx];
+            let heap_pos = self.heap_pos[entry_idx as usize];
 
-            // Remove from heap
             self.heap_len -= 1;
-            if pos < self.heap_len {
-                let last_entry = self.heap[self.heap_len];
-                self.heap[pos] = last_entry;
-                self.heap_pos[last_entry] = pos;
+            if heap_pos < self.heap_len {
+                let last_idx = self.heap_len;
+                self.heap[heap_pos as usize] = self.heap[last_idx as usize];
+                self.heap_pos[self.heap[heap_pos as usize] as usize] = heap_pos;
 
-                // Restore heap property
-                self.sink(pos);
-                self.swim(pos);
+                self.sink(heap_pos);
+                self.swim(heap_pos);
             }
 
-            // Mark as removed
-            self.heap_pos[entry_idx] = NONE;
+            self.heap_pos[entry_idx as usize] = NONE;
 
-            // Take entry
-            let entry = unsafe { self.entries[entry_idx].assume_init_read() };
-
-            // Return slot to free stack
-            self.free_stack[self.free_len] = entry_idx;
+            let entry = unsafe { self.entries[entry_idx as usize].assume_init_read() };
+            self.free_stack[self.free_len as usize] = entry_idx;
             self.free_len += 1;
 
-            Some(entry.value)
-        }
-
-        fn cancel(&mut self, handle: TickerHandle) -> bool {
-            self.remove(handle).is_some()
+            Some(entry.ticker)
         }
 
         fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize {
             let mut fired = 0;
 
             while self.heap_len > 0 {
-                let entry_idx = self.heap[0];
-                let entry = unsafe { self.entries[entry_idx].assume_init_mut() };
+                let entry_idx = self.heap[0] as usize;
 
-                if entry.fire_at > now {
+                let fire_at = unsafe { (*self.entries[entry_idx].as_ptr()).fire_at };
+
+                if fire_at > now {
                     break;
                 }
 
-                entry.value.fire(ctx);
+                let entry = unsafe { self.entries[entry_idx].assume_init_mut() };
+                entry.ticker.fire(ctx);
                 fired += 1;
 
-                // Reschedule
-                let period = entry.value.period().max(MIN_PERIOD);
+                let period = entry.ticker.period().max(MIN_PERIOD);
                 entry.fire_at = now + period;
 
-                // Sink root (fire_at increased)
                 self.sink(0);
             }
 
             fired
         }
 
+        #[inline]
         fn peek_next_fire(&self) -> Option<Instant> {
             if self.heap_len == 0 {
                 return None;
             }
-            let entry_idx = self.heap[0];
-            Some(unsafe { self.entries[entry_idx].assume_init_ref() }.fire_at)
+
+            let entry_idx = self.heap[0] as usize;
+            Some(unsafe { (*self.entries[entry_idx].as_ptr()).fire_at })
         }
 
+        #[inline]
         fn is_active(&self, handle: TickerHandle) -> bool {
-            let idx = handle.0;
-            idx < CAP && self.heap_pos[idx] != NONE
+            let entry_idx = handle.0 as usize;
+            entry_idx < CAP && self.heap_pos[entry_idx] != NONE
         }
 
+        #[inline]
         fn len(&self) -> usize {
-            self.heap_len
+            self.heap_len as usize
         }
+    }
 
-        fn is_empty(&self) -> bool {
-            self.heap_len == 0
+    impl<T, const CAP: usize> Drop for TickerHeap<T, CAP> {
+        fn drop(&mut self) {
+            for i in 0..self.heap_len {
+                let entry_idx = self.heap[i as usize] as usize;
+                unsafe { self.entries[entry_idx].assume_init_drop() };
+            }
         }
     }
 }
