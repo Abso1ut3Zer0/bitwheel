@@ -207,12 +207,6 @@ impl<
             return 0;
         }
 
-        // Fast path: empty wheel, just advance time
-        if self.is_empty() {
-            self.current_tick = target_tick;
-            return 0;
-        }
-
         // Skip-ahead optimization
         match self.next_fire_tick {
             None => {
