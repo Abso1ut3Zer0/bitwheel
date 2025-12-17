@@ -916,3 +916,362 @@ mod tests {
         assert_eq!(ctx, 10 + 3 + 2);
     }
 }
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    use hdrhistogram::Histogram;
+    use std::time::{Duration, Instant};
+
+    const WARMUP: u64 = 100_000;
+    const ITERATIONS: u64 = 1_000_000;
+
+    // ==================== Test Ticker for Benchmarks ====================
+
+    struct BenchTicker {
+        period: Duration,
+    }
+
+    impl BenchTicker {
+        fn new(period_ms: u64) -> Self {
+            Self {
+                period: Duration::from_millis(period_ms),
+            }
+        }
+    }
+
+    impl Ticker for BenchTicker {
+        type Context = ();
+
+        fn fire(&mut self, _ctx: &mut Self::Context) {}
+
+        fn period(&self) -> Duration {
+            self.period
+        }
+    }
+
+    fn print_histogram(name: &str, hist: &Histogram<u64>) {
+        println!("\n=== {} ===", name);
+        println!("  count:  {}", hist.len());
+        println!("  min:    {} ns", hist.min());
+        println!("  max:    {} ns", hist.max());
+        println!("  mean:   {:.1} ns", hist.mean());
+        println!("  stddev: {:.1} ns", hist.stdev());
+        println!("  p50:    {} ns", hist.value_at_quantile(0.50));
+        println!("  p90:    {} ns", hist.value_at_quantile(0.90));
+        println!("  p99:    {} ns", hist.value_at_quantile(0.99));
+        println!("  p99.9:  {} ns", hist.value_at_quantile(0.999));
+        println!("  p99.99: {} ns", hist.value_at_quantile(0.9999));
+    }
+
+    // ==================== Insert Latency ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_insert_latency() {
+        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let now = Instant::now();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let period = (i % 500) + 10;
+            let handle = heap.insert(BenchTicker::new(period), now).unwrap();
+            heap.remove(handle);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let period = (i % 500) + 10;
+
+            let start = Instant::now();
+            let handle = heap.insert(BenchTicker::new(period), now).unwrap();
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+            heap.remove(handle);
+        }
+
+        print_histogram("Insert Latency", &hist);
+    }
+
+    // ==================== Remove Latency ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_remove_latency() {
+        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let now = Instant::now();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let period = (i % 500) + 10;
+            let handle = heap.insert(BenchTicker::new(period), now).unwrap();
+            heap.remove(handle);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let period = (i % 500) + 10;
+            let handle = heap.insert(BenchTicker::new(period), now).unwrap();
+
+            let start = Instant::now();
+            heap.remove(handle);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Remove Latency", &hist);
+    }
+
+    // ==================== Poll Empty ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_empty() {
+        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+        let now = Instant::now();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let poll_time = now + Duration::from_millis(i);
+            heap.poll(poll_time, &mut ctx);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let poll_time = now + Duration::from_millis(WARMUP + i);
+
+            let start = Instant::now();
+            heap.poll(poll_time, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Poll Empty", &hist);
+    }
+
+    // ==================== Poll Pending (No Fires) ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_pending_no_fires() {
+        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+        let now = Instant::now();
+
+        // Insert tickers far in future
+        for i in 0..16 {
+            let period = 100_000_000 + i;
+            heap.insert(BenchTicker::new(period), now).unwrap();
+        }
+
+        // Warmup
+        for i in 0..WARMUP {
+            let poll_time = now + Duration::from_millis(i);
+            heap.poll(poll_time, &mut ctx);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let poll_time = now + Duration::from_millis(WARMUP + i);
+
+            let start = Instant::now();
+            heap.poll(poll_time, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Poll Pending (No Fires)", &hist);
+    }
+
+    // ==================== Poll Single Fire ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_poll_single_fire() {
+        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+        let now = Instant::now();
+
+        // One ticker that fires every ms
+        heap.insert(BenchTicker::new(1), now).unwrap();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let poll_time = now + Duration::from_millis(i + 1);
+            heap.poll(poll_time, &mut ctx);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let poll_time = now + Duration::from_millis(WARMUP + i + 1);
+
+            let start = Instant::now();
+            heap.poll(poll_time, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Poll Single Fire", &hist);
+    }
+
+    // ==================== Periodic Steady State ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_periodic_steady_state() {
+        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+        let now = Instant::now();
+
+        // 10 tickers with 1ms period (all fire every tick)
+        for i in 0..10 {
+            heap.insert(BenchTicker::new(1), now + Duration::from_micros(i * 100))
+                .unwrap();
+        }
+
+        // Warmup
+        for i in 0..WARMUP {
+            let poll_time = now + Duration::from_millis(i + 1);
+            heap.poll(poll_time, &mut ctx);
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let poll_time = now + Duration::from_millis(WARMUP + i + 1);
+
+            let start = Instant::now();
+            heap.poll(poll_time, &mut ctx);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Periodic Steady State (10 tickers @ 1ms)", &hist);
+    }
+
+    // ==================== Realistic Heartbeat Scenario ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_realistic_heartbeats() {
+        let mut heap: TickerHeap<BenchTicker, 32> = TickerHeap::new();
+        let mut insert_hist = Histogram::<u64>::new(3).unwrap();
+        let mut poll_hist = Histogram::<u64>::new(3).unwrap();
+        let mut remove_hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+        let now = Instant::now();
+
+        // Simulate: 5 venue heartbeats at different periods
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let period = 10 + i * 5; // 10, 15, 20, 25, 30ms
+            let h = heap.insert(BenchTicker::new(period), now).unwrap();
+            handles.push(h);
+        }
+
+        // Warmup
+        for i in 0..WARMUP {
+            let poll_time = now + Duration::from_millis(i + 1);
+            heap.poll(poll_time, &mut ctx);
+
+            // Occasionally add/remove a ticker (simulating venue connect/disconnect)
+            // Keep adds and removes balanced
+            if i % 1000 == 0 && handles.len() < 20 {
+                let h = heap.insert(BenchTicker::new(50), poll_time).unwrap();
+                handles.push(h);
+            }
+            if i % 1000 == 500 && handles.len() > 5 {
+                if let Some(h) = handles.pop() {
+                    heap.remove(h);
+                }
+            }
+        }
+
+        // Measure
+        for i in 0..ITERATIONS {
+            let poll_time = now + Duration::from_millis(WARMUP + i + 1);
+
+            // Poll
+            let start = Instant::now();
+            heap.poll(poll_time, &mut ctx);
+            poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
+
+            // Occasionally add ticker (venue reconnect)
+            if i % 1000 == 0 && handles.len() < 20 {
+                let start = Instant::now();
+                let h = heap.insert(BenchTicker::new(50), poll_time).unwrap();
+                insert_hist
+                    .record(start.elapsed().as_nanos() as u64)
+                    .unwrap();
+                handles.push(h);
+            }
+
+            // Occasionally remove ticker (venue disconnect)
+            if i % 1000 == 500 && handles.len() > 5 {
+                if let Some(h) = handles.pop() {
+                    let start = Instant::now();
+                    heap.remove(h);
+                    remove_hist
+                        .record(start.elapsed().as_nanos() as u64)
+                        .unwrap();
+                }
+            }
+        }
+
+        print_histogram("Heartbeat Scenario - Insert", &insert_hist);
+        print_histogram("Heartbeat Scenario - Poll", &poll_hist);
+        print_histogram("Heartbeat Scenario - Remove", &remove_hist);
+    }
+
+    // ==================== Stable Handle Cancel After Fires ====================
+
+    #[test]
+    #[ignore]
+    fn hdr_cancel_after_fires() {
+        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        let mut ctx = ();
+        let now = Instant::now();
+
+        // Warmup
+        for i in 0..WARMUP {
+            let poll_time = now + Duration::from_millis(i);
+            let h = heap.insert(BenchTicker::new(1), poll_time).unwrap();
+            // Fire it multiple times
+            heap.poll(poll_time + Duration::from_millis(5), &mut ctx);
+            heap.remove(h);
+        }
+
+        // Measure: insert, let it fire several times, then cancel
+        for i in 0..ITERATIONS {
+            let base_time = now + Duration::from_millis(WARMUP + i * 10);
+            let h = heap.insert(BenchTicker::new(1), base_time).unwrap();
+
+            // Fire it 3 times
+            heap.poll(base_time + Duration::from_millis(1), &mut ctx);
+            heap.poll(base_time + Duration::from_millis(2), &mut ctx);
+            heap.poll(base_time + Duration::from_millis(3), &mut ctx);
+
+            // Now cancel with original handle
+            let start = Instant::now();
+            heap.remove(h);
+            let elapsed = start.elapsed().as_nanos() as u64;
+
+            hist.record(elapsed).unwrap();
+        }
+
+        print_histogram("Cancel After Multiple Fires", &hist);
+    }
+}
