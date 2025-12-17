@@ -103,11 +103,11 @@ impl<
         }
     }
 
-    pub fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize
+    pub fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize
     where
         T: Timer,
     {
-        let fired_from_wheel = self.wheel.poll(ctx, now);
+        let fired_from_wheel = self.wheel.poll(now, ctx);
         let mut fired_from_failover = 0;
 
         // Check failover every FAILOVER_INTERVAL ticks
@@ -404,7 +404,7 @@ mod tests {
 
         // Poll past the timer's deadline
         let mut ctx = Vec::new();
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
+        wheel.poll(epoch + Duration::from_millis(100), &mut ctx);
 
         // Timer already fired, cancel should return None
         let cancelled = wheel.cancel(handle);
@@ -453,7 +453,7 @@ mod tests {
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         let mut ctx = Vec::new();
-        let fired = wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
+        let fired = wheel.poll(epoch + Duration::from_millis(100), &mut ctx);
 
         assert_eq!(fired, 0);
         assert!(ctx.is_empty());
@@ -469,7 +469,7 @@ mod tests {
         wheel.insert(epoch + Duration::from_millis(100), timer);
 
         let mut ctx = Vec::new();
-        let result = wheel.poll(&mut ctx, epoch + Duration::from_millis(50));
+        let result = wheel.poll(epoch + Duration::from_millis(50), &mut ctx);
 
         assert_eq!(result, 0);
         assert!(!fired.get());
@@ -486,7 +486,7 @@ mod tests {
         wheel.insert(epoch + Duration::from_millis(10), timer);
 
         let mut ctx = Vec::new();
-        let result = wheel.poll(&mut ctx, epoch + Duration::from_millis(10));
+        let result = wheel.poll(epoch + Duration::from_millis(10), &mut ctx);
 
         assert_eq!(result, 1);
         assert!(fired.get());
@@ -503,7 +503,7 @@ mod tests {
         wheel.insert(epoch + Duration::from_millis(10), timer);
 
         let mut ctx = Vec::new();
-        let result = wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
+        let result = wheel.poll(epoch + Duration::from_millis(100), &mut ctx);
 
         assert_eq!(result, 1);
         assert!(fired.get());
@@ -520,7 +520,7 @@ mod tests {
         wheel.insert(epoch + Duration::from_millis(10), timer);
 
         let mut ctx = Vec::new();
-        let fired = wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
+        let fired = wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
 
         assert_eq!(fired, 1);
         assert!(fired_flag.get());
@@ -548,13 +548,13 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll at 20ms - wheel timer fires, but failover not drained yet
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
+        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
         assert!(f1.get());
         assert!(!f2.get()); // failover not drained yet
         assert_eq!(wheel.failover_len(), 1);
 
         // Poll past failover interval boundary (32ms) - failover drains
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
+        wheel.poll(epoch + Duration::from_millis(35), &mut ctx);
         assert!(f2.get());
         assert_eq!(wheel.failover_len(), 0);
         assert!(wheel.is_empty());
@@ -579,12 +579,12 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll at 20ms - before interval boundary, failover should NOT drain
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
+        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
         assert!(!f2.get());
         assert_eq!(wheel.failover_len(), 1);
 
         // Poll at 31ms - still before interval boundary
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(31));
+        wheel.poll(epoch + Duration::from_millis(31), &mut ctx);
         assert!(!f2.get());
         assert_eq!(wheel.failover_len(), 1);
     }
@@ -605,7 +605,7 @@ mod tests {
         wheel.insert(when, t3);
 
         let mut ctx = Vec::new();
-        let result = wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
+        let result = wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
 
         assert_eq!(result, 3);
         assert!(f1.get());
@@ -630,7 +630,7 @@ mod tests {
 
         // Poll at 15ms - only first should fire
         let mut ctx = Vec::new();
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(15));
+        wheel.poll(epoch + Duration::from_millis(15), &mut ctx);
         assert!(f1.get());
         assert!(!f2.get());
         assert!(!f3.get());
@@ -638,14 +638,14 @@ mod tests {
 
         // Poll at 25ms - second should fire
         ctx.clear();
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(25));
+        wheel.poll(epoch + Duration::from_millis(25), &mut ctx);
         assert!(f2.get());
         assert!(!f3.get());
         assert_eq!(ctx, vec![2]);
 
         // Poll at 35ms - third should fire
         ctx.clear();
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
+        wheel.poll(epoch + Duration::from_millis(35), &mut ctx);
         assert!(f3.get());
         assert_eq!(ctx, vec![3]);
     }
@@ -666,12 +666,12 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll at 15ms - fires wheel timer only
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(15));
+        wheel.poll(epoch + Duration::from_millis(15), &mut ctx);
         assert!(f1.get());
         assert!(!f2.get());
 
         // Poll past interval boundary - fires failover timer
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
+        wheel.poll(epoch + Duration::from_millis(35), &mut ctx);
         assert!(f2.get());
 
         assert!(wheel.is_empty());
@@ -688,7 +688,7 @@ mod tests {
         assert!(!wheel.is_empty());
 
         let mut ctx = Vec::new();
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
+        wheel.poll(epoch + Duration::from_millis(100), &mut ctx);
         assert!(wheel.is_empty());
     }
 
@@ -705,11 +705,11 @@ mod tests {
         let now = epoch + Duration::from_millis(20);
 
         // First poll fires the timer
-        let r1 = wheel.poll(&mut ctx, now);
+        let r1 = wheel.poll(now, &mut ctx);
         assert_eq!(r1, 1);
 
         // Second poll at same instant should be no-op
-        let r2 = wheel.poll(&mut ctx, now);
+        let r2 = wheel.poll(now, &mut ctx);
         assert_eq!(r2, 0);
     }
 
@@ -801,7 +801,7 @@ mod tests {
 
         // Poll past interval boundary drains failover
         let mut ctx = Vec::new();
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
+        wheel.poll(epoch + Duration::from_millis(35), &mut ctx);
         assert_eq!(wheel.failover_len(), 0);
     }
 
@@ -820,7 +820,7 @@ mod tests {
         assert!(!wheel.is_empty());
 
         let mut ctx = Vec::new();
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
+        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
         assert!(wheel.is_empty());
     }
 
@@ -844,11 +844,11 @@ mod tests {
 
         // Poll fires wheel timer but not failover (before interval)
         let mut ctx = Vec::new();
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
+        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
         assert!(!wheel.is_empty()); // failover still has timer
 
         // Poll past interval boundary fires failover
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
+        wheel.poll(epoch + Duration::from_millis(35), &mut ctx);
         assert!(wheel.is_empty());
     }
 
@@ -869,7 +869,7 @@ mod tests {
         let mut count = 0usize;
 
         // Poll past multiple intervals to ensure all failover timers drain
-        wheel.poll(&mut count, epoch + Duration::from_millis(ONE_LAP_MS * 3));
+        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS * 3), &mut count);
 
         assert_eq!(count, 1000);
         assert!(wheel.is_empty());
@@ -903,7 +903,7 @@ mod tests {
 
         // All should still fire (poll past interval boundary)
         let mut count = 0usize;
-        wheel.poll(&mut count, epoch + Duration::from_millis(35));
+        wheel.poll(epoch + Duration::from_millis(35), &mut count);
         assert_eq!(count, 5);
     }
 
@@ -928,12 +928,12 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll at 31ms - just before interval boundary
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(31));
+        wheel.poll(epoch + Duration::from_millis(31), &mut ctx);
         assert!(!f2.get());
         assert_eq!(wheel.failover_len(), 1);
 
         // Poll at 32ms - crosses interval boundary, failover drains
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(32));
+        wheel.poll(epoch + Duration::from_millis(32), &mut ctx);
         assert!(f2.get());
         assert_eq!(wheel.failover_len(), 0);
     }
@@ -960,7 +960,7 @@ mod tests {
         }
 
         // Poll through all intervals
-        wheel.poll(&mut ctx, epoch + Duration::from_millis(200));
+        wheel.poll(epoch + Duration::from_millis(200), &mut ctx);
 
         assert_eq!(ctx.len(), 10); // 5 intervals × 2 timers
         assert!(wheel.is_empty());
@@ -1116,7 +1116,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i);
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
         }
 
         // Measure
@@ -1124,7 +1124,7 @@ mod latency_tests {
             let now = epoch + Duration::from_millis(i);
 
             let start = Instant::now();
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1152,7 +1152,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i);
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
         }
 
         // Measure
@@ -1160,7 +1160,7 @@ mod latency_tests {
             let now = epoch + Duration::from_millis(i);
 
             let start = Instant::now();
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1184,7 +1184,7 @@ mod latency_tests {
             let when = epoch + Duration::from_millis(i + 1);
             let _ = wheel.insert(when, LatencyTimer);
             let now = epoch + Duration::from_millis(i + 1);
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
         }
 
         // Measure: insert timer, advance time, poll fires it
@@ -1196,7 +1196,7 @@ mod latency_tests {
             let now = epoch + Duration::from_millis(tick + 1);
 
             let start = Instant::now();
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1223,7 +1223,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             now += Duration::from_millis(1);
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
 
             if i % 5 != 0 {
                 let when = now + Duration::from_millis(50 + (i % 200));
@@ -1246,7 +1246,7 @@ mod latency_tests {
 
             // Poll
             let start = Instant::now();
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
             poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
 
             // Insert 80%
@@ -1303,7 +1303,7 @@ mod latency_tests {
                 }
             }
 
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
         }
 
         // Measure
@@ -1319,7 +1319,7 @@ mod latency_tests {
             }
 
             let start = Instant::now();
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1348,7 +1348,7 @@ mod latency_tests {
         // Warmup - insert timers that land BETWEEN existing entries
         for i in 0..WARMUP {
             now += Duration::from_millis(1);
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
 
             let base = 100 + ((i % 990) * 10);
             let when = epoch + Duration::from_millis(base + 5);
@@ -1358,7 +1358,7 @@ mod latency_tests {
         // Measure - every insert lands between two existing timers
         for i in 0..ITERATIONS {
             now += Duration::from_millis(1);
-            wheel.poll(&mut ctx, now);
+            wheel.poll(now, &mut ctx);
 
             // Replenish the "grid" timers as they fire
             if i % 10 == 0 {

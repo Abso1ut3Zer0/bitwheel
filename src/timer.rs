@@ -36,7 +36,7 @@ pub trait TimerDriver<T: Timer>: Default {
     /// Poll the wheel, firing all timers due by `now`.
     ///
     /// Returns the number of timers fired.
-    fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize;
+    fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize;
 }
 
 impl<T, const G: usize, const R: u64, const S: usize, const P: usize> TimerDriver<T>
@@ -57,8 +57,8 @@ where
     }
 
     #[inline(always)]
-    fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize {
-        BitWheel::poll(self, ctx, now)
+    fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize {
+        BitWheel::poll(self, now, ctx)
     }
 }
 
@@ -82,8 +82,8 @@ where
 
     /// Infallible poll - reschedule failures go to failover, never lost.
     #[inline(always)]
-    fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize {
-        BitWheelWithFailover::poll(self, ctx, now)
+    fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize {
+        BitWheelWithFailover::poll(self, now, ctx)
     }
 }
 
