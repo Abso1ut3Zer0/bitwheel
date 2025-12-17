@@ -226,7 +226,7 @@ impl<
 
         let mut fired = 0;
         for tick in (self.current_tick + 1)..=target_tick {
-            fired += self.poll_tick(tick, now, ctx);
+            fired += self.poll_tick(tick, ctx);
         }
 
         self.current_tick = target_tick;
@@ -235,7 +235,7 @@ impl<
     }
 
     #[inline(always)]
-    fn poll_tick(&mut self, tick: u64, now: Instant, ctx: &mut T::Context) -> usize
+    fn poll_tick(&mut self, tick: u64, ctx: &mut T::Context) -> usize
     where
         T: Timer,
     {
@@ -249,20 +249,14 @@ impl<
             }
 
             let slot = self.slot_for_tick(gear_idx, tick);
-            fired += self.drain_and_fire(gear_idx, slot, now, ctx);
+            fired += self.drain_and_fire(gear_idx, slot, ctx);
         }
 
         fired
     }
 
     #[inline(always)]
-    fn drain_and_fire(
-        &mut self,
-        gear_idx: usize,
-        slot: usize,
-        now: Instant,
-        ctx: &mut T::Context,
-    ) -> usize
+    fn drain_and_fire(&mut self, gear_idx: usize, slot: usize, ctx: &mut T::Context) -> usize
     where
         T: Timer,
     {
@@ -273,7 +267,7 @@ impl<
             self.gear_dirty |= 1 << gear_idx;
 
             fired += 1;
-            timer.fire(ctx, now);
+            timer.fire(ctx);
         }
 
         fired
@@ -390,7 +384,7 @@ mod tests {
     impl Timer for OneShotTimer {
         type Context = Vec<usize>;
 
-        fn fire(&mut self, ctx: &mut Self::Context, _now: Instant) {
+        fn fire(&mut self, ctx: &mut Self::Context) {
             self.fired.set(true);
             ctx.push(self.id);
         }
@@ -402,7 +396,7 @@ mod tests {
     impl Timer for CounterTimer {
         type Context = usize;
 
-        fn fire(&mut self, ctx: &mut Self::Context, _now: Instant) {
+        fn fire(&mut self, ctx: &mut Self::Context) {
             *ctx += 1;
         }
     }
@@ -1021,7 +1015,7 @@ mod tests {
 
         impl Timer for DropCounter {
             type Context = ();
-            fn fire(&mut self, _ctx: &mut (), _now: Instant) {}
+            fn fire(&mut self, _ctx: &mut ()) {}
         }
 
         let drop_count = Arc::new(AtomicUsize::new(0));
@@ -1182,7 +1176,7 @@ mod latency_tests {
     impl Timer for LatencyTimer {
         type Context = ();
 
-        fn fire(&mut self, _ctx: &mut (), _now: Instant) {}
+        fn fire(&mut self, _ctx: &mut ()) {}
     }
 
     fn print_histogram(name: &str, hist: &Histogram<u64>) {

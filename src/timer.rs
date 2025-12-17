@@ -13,7 +13,7 @@ pub use crate::timer::gear::InsertError;
 pub trait Timer {
     type Context;
 
-    fn fire(&mut self, ctx: &mut Self::Context, now: Instant);
+    fn fire(&mut self, ctx: &mut Self::Context);
 }
 
 /// Trait for timer driver implementations.
