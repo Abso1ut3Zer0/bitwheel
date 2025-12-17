@@ -3,26 +3,26 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use heap::{DEFAULT_TICKER_CAP, MIN_PERIOD, TickerHeap};
+pub use heap::{DEFAULT_TICKER_CAP, IntervalHeap, MIN_PERIOD};
 
-pub type TickerHeap16<T> = TickerHeap<T, 16>;
-pub type TickerHeap32<T> = TickerHeap<T, 32>;
-pub type TickerHeap64<T> = TickerHeap<T, 64>;
-pub type TickerHeap128<T> = TickerHeap<T, 128>;
-pub type TickerHeap256<T> = TickerHeap<T, 256>;
-pub type TickerHeap512<T> = TickerHeap<T, 512>;
+pub type IntervalHeap16<T> = IntervalHeap<T, 16>;
+pub type IntervalHeap32<T> = IntervalHeap<T, 32>;
+pub type IntervalHeap64<T> = IntervalHeap<T, 64>;
+pub type IntervalHeap128<T> = IntervalHeap<T, 128>;
+pub type IntervalHeap256<T> = IntervalHeap<T, 256>;
+pub type IntervalHeap512<T> = IntervalHeap<T, 512>;
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("could not insert into ticker heap")]
+#[error("could not insert into interval heap")]
 pub struct InsertError<T>(pub T);
 
 impl<T> Debug for InsertError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("could not insert into ticker heap")
+        f.write_str("could not insert into interval heap")
     }
 }
 
-pub trait Ticker {
+pub trait Interval {
     type Context;
 
     fn fire(&mut self, ctx: &mut Self::Context);
@@ -31,17 +31,17 @@ pub trait Ticker {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TickerHandle(pub(crate) u16);
+pub struct IntervalHandle(pub(crate) u16);
 
-pub trait TickerDriver<T: Ticker> {
-    fn insert(&mut self, ticker: T, now: Instant) -> Result<TickerHandle, InsertError<T>>;
-    fn remove(&mut self, handle: TickerHandle) -> Option<T>;
-    fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize;
+pub trait IntervalDriver<T: Interval> {
+    fn insert(&mut self, now: Instant, interval: T) -> Result<IntervalHandle, InsertError<T>>;
+    fn remove(&mut self, handle: IntervalHandle) -> Option<T>;
+    fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize;
     fn peek_next_fire(&self) -> Option<Instant>;
-    fn is_active(&self, handle: TickerHandle) -> bool;
+    fn is_active(&self, handle: IntervalHandle) -> bool;
     fn len(&self) -> usize;
 
-    fn cancel(&mut self, handle: TickerHandle) -> bool {
+    fn cancel(&mut self, handle: IntervalHandle) -> bool {
         self.remove(handle).is_some()
     }
 
@@ -59,17 +59,17 @@ mod heap {
     const NONE: u16 = u16::MAX;
 
     struct Entry<T> {
-        ticker: T,
+        interval: T,
         fire_at: Instant,
     }
 
-    /// Fixed-capacity min-heap for periodic tickers.
+    /// Fixed-capacity min-heap for periodic intervals.
     ///
-    /// Optimized for small n (16-128 tickers) with:
+    /// Optimized for small n (16-128 intervals) with:
     /// - u16 indices for cache-friendly heap operations
     /// - Stable handles across reschedules
     /// - O(1) peek, O(log n) insert/remove/poll
-    pub struct TickerHeap<T, const CAP: usize = DEFAULT_TICKER_CAP> {
+    pub struct IntervalHeap<T, const CAP: usize = DEFAULT_TICKER_CAP> {
         entries: [MaybeUninit<Entry<T>>; CAP],
         free_stack: [u16; CAP],
         free_len: u16,
@@ -78,13 +78,13 @@ mod heap {
         heap_pos: [u16; CAP],
     }
 
-    impl<T, const CAP: usize> Default for TickerHeap<T, CAP> {
+    impl<T, const CAP: usize> Default for IntervalHeap<T, CAP> {
         fn default() -> Self {
             Self::new()
         }
     }
 
-    impl<T, const CAP: usize> TickerHeap<T, CAP> {
+    impl<T, const CAP: usize> IntervalHeap<T, CAP> {
         pub fn new() -> Self {
             const {
                 assert!(CAP > 0, "capacity must be > 0");
@@ -163,18 +163,18 @@ mod heap {
         }
     }
 
-    impl<T: Ticker, const CAP: usize> TickerDriver<T> for TickerHeap<T, CAP> {
-        fn insert(&mut self, ticker: T, now: Instant) -> Result<TickerHandle, InsertError<T>> {
+    impl<T: Interval, const CAP: usize> IntervalDriver<T> for IntervalHeap<T, CAP> {
+        fn insert(&mut self, now: Instant, interval: T) -> Result<IntervalHandle, InsertError<T>> {
             if self.free_len == 0 {
-                return Err(InsertError(ticker));
+                return Err(InsertError(interval));
             }
 
             self.free_len -= 1;
             let entry_idx = self.free_stack[self.free_len as usize];
 
-            let period = ticker.period().max(MIN_PERIOD);
+            let period = interval.period().max(MIN_PERIOD);
             let entry = Entry {
-                ticker,
+                interval,
                 fire_at: now + period,
             };
             self.entries[entry_idx as usize].write(entry);
@@ -186,10 +186,10 @@ mod heap {
 
             self.swim(heap_pos);
 
-            Ok(TickerHandle(entry_idx))
+            Ok(IntervalHandle(entry_idx))
         }
 
-        fn remove(&mut self, handle: TickerHandle) -> Option<T> {
+        fn remove(&mut self, handle: IntervalHandle) -> Option<T> {
             let entry_idx = handle.0;
 
             if entry_idx as usize >= CAP || self.heap_pos[entry_idx as usize] == NONE {
@@ -214,10 +214,10 @@ mod heap {
             self.free_stack[self.free_len as usize] = entry_idx;
             self.free_len += 1;
 
-            Some(entry.ticker)
+            Some(entry.interval)
         }
 
-        fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize {
+        fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize {
             let mut fired = 0;
 
             while self.heap_len > 0 {
@@ -230,10 +230,10 @@ mod heap {
                 }
 
                 let entry = unsafe { self.entries[entry_idx].assume_init_mut() };
-                entry.ticker.fire(ctx);
+                entry.interval.fire(ctx);
                 fired += 1;
 
-                let period = entry.ticker.period().max(MIN_PERIOD);
+                let period = entry.interval.period().max(MIN_PERIOD);
                 entry.fire_at = now + period;
 
                 self.sink(0);
@@ -253,7 +253,7 @@ mod heap {
         }
 
         #[inline]
-        fn is_active(&self, handle: TickerHandle) -> bool {
+        fn is_active(&self, handle: IntervalHandle) -> bool {
             let entry_idx = handle.0 as usize;
             entry_idx < CAP && self.heap_pos[entry_idx] != NONE
         }
@@ -264,7 +264,7 @@ mod heap {
         }
     }
 
-    impl<T, const CAP: usize> Drop for TickerHeap<T, CAP> {
+    impl<T, const CAP: usize> Drop for IntervalHeap<T, CAP> {
         fn drop(&mut self) {
             for i in 0..self.heap_len {
                 let entry_idx = self.heap[i as usize] as usize;
@@ -280,15 +280,15 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    // ==================== Test Ticker Implementations ====================
+    // ==================== Test Interval Implementations ====================
 
-    struct SimpleTicker {
+    struct SimpleInterval {
         id: usize,
         period: Duration,
         fire_count: Rc<Cell<usize>>,
     }
 
-    impl SimpleTicker {
+    impl SimpleInterval {
         fn new(id: usize, period_ms: u64) -> (Self, Rc<Cell<usize>>) {
             let fire_count = Rc::new(Cell::new(0));
             (
@@ -302,7 +302,7 @@ mod tests {
         }
     }
 
-    impl Ticker for SimpleTicker {
+    impl Interval for SimpleInterval {
         type Context = Vec<usize>;
 
         fn fire(&mut self, ctx: &mut Self::Context) {
@@ -315,11 +315,11 @@ mod tests {
         }
     }
 
-    struct CounterTicker {
+    struct CounterInterval {
         period: Duration,
     }
 
-    impl CounterTicker {
+    impl CounterInterval {
         fn new(period_ms: u64) -> Self {
             Self {
                 period: Duration::from_millis(period_ms),
@@ -327,7 +327,7 @@ mod tests {
         }
     }
 
-    impl Ticker for CounterTicker {
+    impl Interval for CounterInterval {
         type Context = usize;
 
         fn fire(&mut self, ctx: &mut Self::Context) {
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_new_empty() {
-        let heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         assert!(heap.is_empty());
         assert_eq!(heap.len(), 0);
         assert!(heap.peek_next_fire().is_none());
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        let heap: TickerHeap<CounterTicker, 8> = TickerHeap::default();
+        let heap: IntervalHeap<CounterInterval, 8> = IntervalHeap::default();
         assert!(heap.is_empty());
     }
 
@@ -359,10 +359,10 @@ mod tests {
 
     #[test]
     fn test_insert_single() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let handle = heap.insert(CounterTicker::new(100), now).unwrap();
+        let handle = heap.insert(now, CounterInterval::new(100)).unwrap();
 
         assert!(!heap.is_empty());
         assert_eq!(heap.len(), 1);
@@ -372,12 +372,12 @@ mod tests {
 
     #[test]
     fn test_insert_multiple() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let h1 = heap.insert(CounterTicker::new(100), now).unwrap();
-        let h2 = heap.insert(CounterTicker::new(200), now).unwrap();
-        let h3 = heap.insert(CounterTicker::new(50), now).unwrap();
+        let h1 = heap.insert(now, CounterInterval::new(100)).unwrap();
+        let h2 = heap.insert(now, CounterInterval::new(200)).unwrap();
+        let h3 = heap.insert(now, CounterInterval::new(50)).unwrap();
 
         assert_eq!(heap.len(), 3);
         assert!(heap.is_active(h1));
@@ -387,38 +387,38 @@ mod tests {
 
     #[test]
     fn test_insert_at_capacity() {
-        let mut heap: TickerHeap<CounterTicker, 2> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 2> = IntervalHeap::new();
         let now = Instant::now();
 
-        let h1 = heap.insert(CounterTicker::new(100), now);
-        let h2 = heap.insert(CounterTicker::new(100), now);
-        let h3 = heap.insert(CounterTicker::new(100), now);
+        let h1 = heap.insert(now, CounterInterval::new(100));
+        let h2 = heap.insert(now, CounterInterval::new(100));
+        let h3 = heap.insert(now, CounterInterval::new(100));
 
         assert!(h1.is_ok());
         assert!(h2.is_ok());
         assert!(h3.is_err());
 
-        // Verify we get the ticker back on error
+        // Verify we get the interval back on error
         let err = h3.unwrap_err();
         assert_eq!(err.0.period(), Duration::from_millis(100));
     }
 
     #[test]
     fn test_insert_after_remove_reuses_slot() {
-        let mut heap: TickerHeap<CounterTicker, 2> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 2> = IntervalHeap::new();
         let now = Instant::now();
 
-        let h1 = heap.insert(CounterTicker::new(100), now).unwrap();
-        let h2 = heap.insert(CounterTicker::new(100), now).unwrap();
+        let h1 = heap.insert(now, CounterInterval::new(100)).unwrap();
+        let h2 = heap.insert(now, CounterInterval::new(100)).unwrap();
 
         // Full
-        assert!(heap.insert(CounterTicker::new(100), now).is_err());
+        assert!(heap.insert(now, CounterInterval::new(100)).is_err());
 
         // Remove one
         heap.remove(h1);
 
         // Can insert again
-        let h3 = heap.insert(CounterTicker::new(100), now);
+        let h3 = heap.insert(now, CounterInterval::new(100));
         assert!(h3.is_ok());
 
         // h2 still active
@@ -429,13 +429,13 @@ mod tests {
 
     #[test]
     fn test_peek_returns_earliest() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
         // Insert in non-sorted order
-        heap.insert(CounterTicker::new(300), now).unwrap();
-        heap.insert(CounterTicker::new(100), now).unwrap();
-        heap.insert(CounterTicker::new(200), now).unwrap();
+        heap.insert(now, CounterInterval::new(300)).unwrap();
+        heap.insert(now, CounterInterval::new(100)).unwrap();
+        heap.insert(now, CounterInterval::new(200)).unwrap();
 
         let next = heap.peek_next_fire().unwrap();
         let expected = now + Duration::from_millis(100);
@@ -445,27 +445,27 @@ mod tests {
 
     #[test]
     fn test_poll_fires_in_order() {
-        let mut heap: TickerHeap<SimpleTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<SimpleInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let (t1, _) = SimpleTicker::new(1, 100);
-        let (t2, _) = SimpleTicker::new(2, 50);
-        let (t3, _) = SimpleTicker::new(3, 150);
+        let (t1, _) = SimpleInterval::new(1, 100);
+        let (t2, _) = SimpleInterval::new(2, 50);
+        let (t3, _) = SimpleInterval::new(3, 150);
 
-        heap.insert(t1, now).unwrap();
-        heap.insert(t2, now).unwrap();
-        heap.insert(t3, now).unwrap();
+        heap.insert(now, t1).unwrap();
+        heap.insert(now, t2).unwrap();
+        heap.insert(now, t3).unwrap();
 
         let mut ctx = Vec::new();
 
-        // Poll at 60ms - only ticker 2 (50ms) should fire
-        let fired = heap.poll(&mut ctx, now + Duration::from_millis(60));
+        // Poll at 60ms - only interval 2 (50ms) should fire
+        let fired = heap.poll(now + Duration::from_millis(60), &mut ctx);
         assert_eq!(fired, 1);
         assert_eq!(ctx, vec![2]);
 
-        // Poll at 110ms - ticker 2 fires again (rescheduled to 110), ticker 1 fires (100)
+        // Poll at 110ms - interval 2 fires again (rescheduled to 110), interval 1 fires (100)
         ctx.clear();
-        let fired = heap.poll(&mut ctx, now + Duration::from_millis(110));
+        let fired = heap.poll(now + Duration::from_millis(110), &mut ctx);
         assert_eq!(fired, 2);
         assert!(ctx.contains(&1));
         assert!(ctx.contains(&2));
@@ -474,12 +474,12 @@ mod tests {
     // ==================== Remove / Cancel ====================
 
     #[test]
-    fn test_remove_returns_ticker() {
-        let mut heap: TickerHeap<SimpleTicker, 4> = TickerHeap::new();
+    fn test_remove_returns_interval() {
+        let mut heap: IntervalHeap<SimpleInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let (ticker, _) = SimpleTicker::new(42, 100);
-        let handle = heap.insert(ticker, now).unwrap();
+        let (interval, _) = SimpleInterval::new(42, 100);
+        let handle = heap.insert(now, interval).unwrap();
 
         let removed = heap.remove(handle);
         assert!(removed.is_some());
@@ -489,18 +489,18 @@ mod tests {
 
     #[test]
     fn test_remove_invalid_handle() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
 
-        let fake_handle = TickerHandle(99);
+        let fake_handle = IntervalHandle(99);
         assert!(heap.remove(fake_handle).is_none());
     }
 
     #[test]
     fn test_double_remove() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let handle = heap.insert(CounterTicker::new(100), now).unwrap();
+        let handle = heap.insert(now, CounterInterval::new(100)).unwrap();
 
         assert!(heap.remove(handle).is_some());
         assert!(heap.remove(handle).is_none());
@@ -508,10 +508,10 @@ mod tests {
 
     #[test]
     fn test_cancel_returns_bool() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let handle = heap.insert(CounterTicker::new(100), now).unwrap();
+        let handle = heap.insert(now, CounterInterval::new(100)).unwrap();
 
         assert!(heap.cancel(handle));
         assert!(!heap.cancel(handle));
@@ -519,23 +519,23 @@ mod tests {
 
     #[test]
     fn test_remove_middle_maintains_heap() {
-        let mut heap: TickerHeap<SimpleTicker, 8> = TickerHeap::new();
+        let mut heap: IntervalHeap<SimpleInterval, 8> = IntervalHeap::new();
         let now = Instant::now();
 
-        let (t1, _) = SimpleTicker::new(1, 100);
-        let (t2, _) = SimpleTicker::new(2, 50);
-        let (t3, _) = SimpleTicker::new(3, 150);
-        let (t4, _) = SimpleTicker::new(4, 75);
+        let (t1, _) = SimpleInterval::new(1, 100);
+        let (t2, _) = SimpleInterval::new(2, 50);
+        let (t3, _) = SimpleInterval::new(3, 150);
+        let (t4, _) = SimpleInterval::new(4, 75);
 
-        heap.insert(t1, now).unwrap();
-        let h2 = heap.insert(t2, now).unwrap();
-        heap.insert(t3, now).unwrap();
-        heap.insert(t4, now).unwrap();
+        heap.insert(now, t1).unwrap();
+        let h2 = heap.insert(now, t2).unwrap();
+        heap.insert(now, t3).unwrap();
+        heap.insert(now, t4).unwrap();
 
-        // Remove ticker 2 (the earliest)
+        // Remove interval 2 (the earliest)
         heap.remove(h2);
 
-        // Next fire should now be ticker 4 (75ms)
+        // Next fire should now be interval 4 (75ms)
         let next = heap.peek_next_fire().unwrap();
         assert_eq!(next, now + Duration::from_millis(75));
     }
@@ -544,24 +544,24 @@ mod tests {
 
     #[test]
     fn test_poll_empty() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
         let mut ctx = 0usize;
 
-        let fired = heap.poll(&mut ctx, now);
+        let fired = heap.poll(now, &mut ctx);
         assert_eq!(fired, 0);
         assert_eq!(ctx, 0);
     }
 
     #[test]
     fn test_poll_before_fire_time() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        heap.insert(CounterTicker::new(100), now).unwrap();
+        heap.insert(now, CounterInterval::new(100)).unwrap();
 
         let mut ctx = 0usize;
-        let fired = heap.poll(&mut ctx, now + Duration::from_millis(50));
+        let fired = heap.poll(now + Duration::from_millis(50), &mut ctx);
 
         assert_eq!(fired, 0);
         assert_eq!(ctx, 0);
@@ -569,13 +569,13 @@ mod tests {
 
     #[test]
     fn test_poll_at_fire_time() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        heap.insert(CounterTicker::new(100), now).unwrap();
+        heap.insert(now, CounterInterval::new(100)).unwrap();
 
         let mut ctx = 0usize;
-        let fired = heap.poll(&mut ctx, now + Duration::from_millis(100));
+        let fired = heap.poll(now + Duration::from_millis(100), &mut ctx);
 
         assert_eq!(fired, 1);
         assert_eq!(ctx, 1);
@@ -583,15 +583,15 @@ mod tests {
 
     #[test]
     fn test_poll_reschedules() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        heap.insert(CounterTicker::new(100), now).unwrap();
+        heap.insert(now, CounterInterval::new(100)).unwrap();
 
         let mut ctx = 0usize;
 
         // First fire at 100ms
-        heap.poll(&mut ctx, now + Duration::from_millis(100));
+        heap.poll(now + Duration::from_millis(100), &mut ctx);
         assert_eq!(ctx, 1);
         assert_eq!(heap.len(), 1); // Still in heap
 
@@ -600,21 +600,21 @@ mod tests {
         assert_eq!(next, now + Duration::from_millis(200));
 
         // Fire again at 200ms
-        heap.poll(&mut ctx, now + Duration::from_millis(200));
+        heap.poll(now + Duration::from_millis(200), &mut ctx);
         assert_eq!(ctx, 2);
     }
 
     #[test]
     fn test_poll_no_catchup_semantics() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        heap.insert(CounterTicker::new(50), now).unwrap();
+        heap.insert(now, CounterInterval::new(50)).unwrap();
 
         let mut ctx = 0usize;
 
         // Poll at 250ms - fires once (no catch-up), reschedules to 300ms
-        let fired = heap.poll(&mut ctx, now + Duration::from_millis(250));
+        let fired = heap.poll(now + Duration::from_millis(250), &mut ctx);
         assert_eq!(fired, 1);
         assert_eq!(ctx, 1);
 
@@ -625,27 +625,27 @@ mod tests {
 
     #[test]
     fn test_poll_incremental() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        heap.insert(CounterTicker::new(50), now).unwrap();
+        heap.insert(now, CounterInterval::new(50)).unwrap();
 
         let mut ctx = 0usize;
 
         // Poll incrementally - this is how it would be used in practice
-        heap.poll(&mut ctx, now + Duration::from_millis(50));
+        heap.poll(now + Duration::from_millis(50), &mut ctx);
         assert_eq!(ctx, 1);
 
-        heap.poll(&mut ctx, now + Duration::from_millis(100));
+        heap.poll(now + Duration::from_millis(100), &mut ctx);
         assert_eq!(ctx, 2);
 
-        heap.poll(&mut ctx, now + Duration::from_millis(150));
+        heap.poll(now + Duration::from_millis(150), &mut ctx);
         assert_eq!(ctx, 3);
 
-        heap.poll(&mut ctx, now + Duration::from_millis(200));
+        heap.poll(now + Duration::from_millis(200), &mut ctx);
         assert_eq!(ctx, 4);
 
-        heap.poll(&mut ctx, now + Duration::from_millis(250));
+        heap.poll(now + Duration::from_millis(250), &mut ctx);
         assert_eq!(ctx, 5);
     }
 
@@ -653,17 +653,17 @@ mod tests {
 
     #[test]
     fn test_handle_stable_across_fires() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let handle = heap.insert(CounterTicker::new(100), now).unwrap();
+        let handle = heap.insert(now, CounterInterval::new(100)).unwrap();
 
         let mut ctx = 0usize;
 
         // Fire multiple times
-        heap.poll(&mut ctx, now + Duration::from_millis(100));
-        heap.poll(&mut ctx, now + Duration::from_millis(200));
-        heap.poll(&mut ctx, now + Duration::from_millis(300));
+        heap.poll(now + Duration::from_millis(100), &mut ctx);
+        heap.poll(now + Duration::from_millis(200), &mut ctx);
+        heap.poll(now + Duration::from_millis(300), &mut ctx);
 
         // Handle still valid
         assert!(heap.is_active(handle));
@@ -677,29 +677,29 @@ mod tests {
 
     #[test]
     fn test_is_active_after_insert() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let handle = heap.insert(CounterTicker::new(100), now).unwrap();
+        let handle = heap.insert(now, CounterInterval::new(100)).unwrap();
         assert!(heap.is_active(handle));
     }
 
     #[test]
     fn test_is_active_after_remove() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let handle = heap.insert(CounterTicker::new(100), now).unwrap();
+        let handle = heap.insert(now, CounterInterval::new(100)).unwrap();
         heap.remove(handle);
         assert!(!heap.is_active(handle));
     }
 
     #[test]
     fn test_is_active_invalid_handle() {
-        let heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
 
-        assert!(!heap.is_active(TickerHandle(0)));
-        assert!(!heap.is_active(TickerHandle(99)));
+        assert!(!heap.is_active(IntervalHandle(0)));
+        assert!(!heap.is_active(IntervalHandle(99)));
     }
 
     // ==================== Drop Behavior ====================
@@ -708,11 +708,11 @@ mod tests {
     fn test_drop_cleans_up_entries() {
         let drop_count = Rc::new(Cell::new(0));
 
-        struct DropTicker {
+        struct DropInterval {
             drop_count: Rc<Cell<usize>>,
         }
 
-        impl Ticker for DropTicker {
+        impl Interval for DropInterval {
             type Context = ();
             fn fire(&mut self, _ctx: &mut Self::Context) {}
             fn period(&self) -> Duration {
@@ -720,35 +720,35 @@ mod tests {
             }
         }
 
-        impl Drop for DropTicker {
+        impl Drop for DropInterval {
             fn drop(&mut self) {
                 self.drop_count.set(self.drop_count.get() + 1);
             }
         }
 
         {
-            let mut heap: TickerHeap<DropTicker, 4> = TickerHeap::new();
+            let mut heap: IntervalHeap<DropInterval, 4> = IntervalHeap::new();
             let now = Instant::now();
 
             heap.insert(
-                DropTicker {
+                now,
+                DropInterval {
                     drop_count: Rc::clone(&drop_count),
                 },
-                now,
             )
             .unwrap();
             heap.insert(
-                DropTicker {
+                now,
+                DropInterval {
                     drop_count: Rc::clone(&drop_count),
                 },
-                now,
             )
             .unwrap();
             heap.insert(
-                DropTicker {
+                now,
+                DropInterval {
                     drop_count: Rc::clone(&drop_count),
                 },
-                now,
             )
             .unwrap();
 
@@ -762,11 +762,11 @@ mod tests {
     fn test_drop_after_partial_remove() {
         let drop_count = Rc::new(Cell::new(0));
 
-        struct DropTicker {
+        struct DropInterval {
             drop_count: Rc<Cell<usize>>,
         }
 
-        impl Ticker for DropTicker {
+        impl Interval for DropInterval {
             type Context = ();
             fn fire(&mut self, _ctx: &mut Self::Context) {}
             fn period(&self) -> Duration {
@@ -774,29 +774,29 @@ mod tests {
             }
         }
 
-        impl Drop for DropTicker {
+        impl Drop for DropInterval {
             fn drop(&mut self) {
                 self.drop_count.set(self.drop_count.get() + 1);
             }
         }
 
         {
-            let mut heap: TickerHeap<DropTicker, 4> = TickerHeap::new();
+            let mut heap: IntervalHeap<DropInterval, 4> = IntervalHeap::new();
             let now = Instant::now();
 
             let h1 = heap
                 .insert(
-                    DropTicker {
+                    now,
+                    DropInterval {
                         drop_count: Rc::clone(&drop_count),
                     },
-                    now,
                 )
                 .unwrap();
             heap.insert(
-                DropTicker {
+                now,
+                DropInterval {
                     drop_count: Rc::clone(&drop_count),
                 },
-                now,
             )
             .unwrap();
 
@@ -811,31 +811,31 @@ mod tests {
 
     #[test]
     fn test_capacity_one() {
-        let mut heap: TickerHeap<CounterTicker, 1> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 1> = IntervalHeap::new();
         let now = Instant::now();
 
-        let h = heap.insert(CounterTicker::new(100), now).unwrap();
-        assert!(heap.insert(CounterTicker::new(100), now).is_err());
+        let h = heap.insert(now, CounterInterval::new(100)).unwrap();
+        assert!(heap.insert(now, CounterInterval::new(100)).is_err());
 
         heap.remove(h);
-        assert!(heap.insert(CounterTicker::new(100), now).is_ok());
+        assert!(heap.insert(now, CounterInterval::new(100)).is_ok());
     }
 
     #[test]
     fn test_same_fire_time() {
-        let mut heap: TickerHeap<SimpleTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<SimpleInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        let (t1, _) = SimpleTicker::new(1, 100);
-        let (t2, _) = SimpleTicker::new(2, 100);
-        let (t3, _) = SimpleTicker::new(3, 100);
+        let (t1, _) = SimpleInterval::new(1, 100);
+        let (t2, _) = SimpleInterval::new(2, 100);
+        let (t3, _) = SimpleInterval::new(3, 100);
 
-        heap.insert(t1, now).unwrap();
-        heap.insert(t2, now).unwrap();
-        heap.insert(t3, now).unwrap();
+        heap.insert(now, t1).unwrap();
+        heap.insert(now, t2).unwrap();
+        heap.insert(now, t3).unwrap();
 
         let mut ctx = Vec::new();
-        let fired = heap.poll(&mut ctx, now + Duration::from_millis(100));
+        let fired = heap.poll(now + Duration::from_millis(100), &mut ctx);
 
         assert_eq!(fired, 3);
         assert_eq!(ctx.len(), 3);
@@ -847,20 +847,20 @@ mod tests {
 
     #[test]
     fn test_zero_period_clamped_to_1ms() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
         // Zero period gets clamped to 1ms
-        heap.insert(CounterTicker::new(0), now).unwrap();
+        heap.insert(now, CounterInterval::new(0)).unwrap();
 
         let mut ctx = 0usize;
 
         // At now, nothing fires (fire_at = now + 1ms)
-        let fired = heap.poll(&mut ctx, now);
+        let fired = heap.poll(now, &mut ctx);
         assert_eq!(fired, 0);
 
         // At now + 1ms, it fires
-        let fired = heap.poll(&mut ctx, now + Duration::from_millis(1));
+        let fired = heap.poll(now + Duration::from_millis(1), &mut ctx);
         assert_eq!(fired, 1);
 
         // Reschedules to now + 2ms
@@ -872,13 +872,13 @@ mod tests {
 
     #[test]
     fn test_fill_and_drain() {
-        let mut heap: TickerHeap<CounterTicker, 8> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 8> = IntervalHeap::new();
         let now = Instant::now();
 
         let mut handles = Vec::new();
         for i in 0..8 {
             let h = heap
-                .insert(CounterTicker::new((i + 1) as u64 * 10), now)
+                .insert(now, CounterInterval::new((i + 1) as u64 * 10))
                 .unwrap();
             handles.push(h);
         }
@@ -894,12 +894,12 @@ mod tests {
 
     #[test]
     fn test_interleaved_insert_remove() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
         // Insert and immediately remove - never exceeds capacity
         for _ in 0..100 {
-            let h = heap.insert(CounterTicker::new(100), now).unwrap();
+            let h = heap.insert(now, CounterInterval::new(100)).unwrap();
             heap.remove(h);
         }
 
@@ -908,23 +908,23 @@ mod tests {
 
     #[test]
     fn test_long_running_incremental_poll() {
-        let mut heap: TickerHeap<CounterTicker, 4> = TickerHeap::new();
+        let mut heap: IntervalHeap<CounterInterval, 4> = IntervalHeap::new();
         let now = Instant::now();
 
-        heap.insert(CounterTicker::new(10), now).unwrap();
-        heap.insert(CounterTicker::new(25), now).unwrap();
-        heap.insert(CounterTicker::new(50), now).unwrap();
+        heap.insert(now, CounterInterval::new(10)).unwrap();
+        heap.insert(now, CounterInterval::new(25)).unwrap();
+        heap.insert(now, CounterInterval::new(50)).unwrap();
 
         let mut ctx = 0usize;
 
         // Poll incrementally every 10ms for 100ms
         for i in 1..=10 {
-            heap.poll(&mut ctx, now + Duration::from_millis(i * 10));
+            heap.poll(now + Duration::from_millis(i * 10), &mut ctx);
         }
 
-        // 10ms ticker: 10 fires (at 10,20,30,40,50,60,70,80,90,100)
-        // 25ms ticker: 3 fires (at 25→30, 55→60, 85→90)
-        // 50ms ticker: 2 fires (at 50, 100)
+        // 10ms interval: 10 fires (at 10,20,30,40,50,60,70,80,90,100)
+        // 25ms interval: 3 fires (at 25→30, 55→60, 85→90)
+        // 50ms interval: 2 fires (at 50, 100)
         assert_eq!(ctx, 10 + 3 + 2);
     }
 }
@@ -938,13 +938,13 @@ mod latency_tests {
     const WARMUP: u64 = 100_000;
     const ITERATIONS: u64 = 1_000_000;
 
-    // ==================== Test Ticker for Benchmarks ====================
+    // ==================== Test Interval for Benchmarks ====================
 
-    struct BenchTicker {
+    struct BenchInterval {
         period: Duration,
     }
 
-    impl BenchTicker {
+    impl BenchInterval {
         fn new(period_ms: u64) -> Self {
             Self {
                 period: Duration::from_millis(period_ms),
@@ -952,7 +952,7 @@ mod latency_tests {
         }
     }
 
-    impl Ticker for BenchTicker {
+    impl Interval for BenchInterval {
         type Context = ();
 
         fn fire(&mut self, _ctx: &mut Self::Context) {}
@@ -981,14 +981,14 @@ mod latency_tests {
     #[test]
     #[ignore]
     fn hdr_insert_latency() {
-        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut heap: IntervalHeap<BenchInterval, 64> = IntervalHeap::new();
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let now = Instant::now();
 
         // Warmup
         for i in 0..WARMUP {
             let period = (i % 500) + 10;
-            let handle = heap.insert(BenchTicker::new(period), now).unwrap();
+            let handle = heap.insert(now, BenchInterval::new(period)).unwrap();
             heap.remove(handle);
         }
 
@@ -997,7 +997,7 @@ mod latency_tests {
             let period = (i % 500) + 10;
 
             let start = Instant::now();
-            let handle = heap.insert(BenchTicker::new(period), now).unwrap();
+            let handle = heap.insert(now, BenchInterval::new(period)).unwrap();
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1012,21 +1012,21 @@ mod latency_tests {
     #[test]
     #[ignore]
     fn hdr_remove_latency() {
-        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut heap: IntervalHeap<BenchInterval, 64> = IntervalHeap::new();
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let now = Instant::now();
 
         // Warmup
         for i in 0..WARMUP {
             let period = (i % 500) + 10;
-            let handle = heap.insert(BenchTicker::new(period), now).unwrap();
+            let handle = heap.insert(now, BenchInterval::new(period)).unwrap();
             heap.remove(handle);
         }
 
         // Measure
         for i in 0..ITERATIONS {
             let period = (i % 500) + 10;
-            let handle = heap.insert(BenchTicker::new(period), now).unwrap();
+            let handle = heap.insert(now, BenchInterval::new(period)).unwrap();
 
             let start = Instant::now();
             heap.remove(handle);
@@ -1043,7 +1043,7 @@ mod latency_tests {
     #[test]
     #[ignore]
     fn hdr_poll_empty() {
-        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut heap: IntervalHeap<BenchInterval, 64> = IntervalHeap::new();
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
         let now = Instant::now();
@@ -1051,7 +1051,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i);
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
         }
 
         // Measure
@@ -1059,7 +1059,7 @@ mod latency_tests {
             let poll_time = now + Duration::from_millis(WARMUP + i);
 
             let start = Instant::now();
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1073,21 +1073,21 @@ mod latency_tests {
     #[test]
     #[ignore]
     fn hdr_poll_pending_no_fires() {
-        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut heap: IntervalHeap<BenchInterval, 64> = IntervalHeap::new();
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
         let now = Instant::now();
 
-        // Insert tickers far in future
+        // Insert intervals far in future
         for i in 0..16 {
             let period = 100_000_000 + i;
-            heap.insert(BenchTicker::new(period), now).unwrap();
+            heap.insert(now, BenchInterval::new(period)).unwrap();
         }
 
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i);
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
         }
 
         // Measure
@@ -1095,7 +1095,7 @@ mod latency_tests {
             let poll_time = now + Duration::from_millis(WARMUP + i);
 
             let start = Instant::now();
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1109,18 +1109,18 @@ mod latency_tests {
     #[test]
     #[ignore]
     fn hdr_poll_single_fire() {
-        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut heap: IntervalHeap<BenchInterval, 64> = IntervalHeap::new();
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
         let now = Instant::now();
 
-        // One ticker that fires every ms
-        heap.insert(BenchTicker::new(1), now).unwrap();
+        // One interval that fires every ms
+        heap.insert(now, BenchInterval::new(1)).unwrap();
 
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i + 1);
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
         }
 
         // Measure
@@ -1128,7 +1128,7 @@ mod latency_tests {
             let poll_time = now + Duration::from_millis(WARMUP + i + 1);
 
             let start = Instant::now();
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1142,21 +1142,21 @@ mod latency_tests {
     #[test]
     #[ignore]
     fn hdr_periodic_steady_state() {
-        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut heap: IntervalHeap<BenchInterval, 64> = IntervalHeap::new();
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
         let now = Instant::now();
 
-        // 10 tickers with 1ms period (all fire every tick)
+        // 10 intervals with 1ms period (all fire every tick)
         for i in 0..10 {
-            heap.insert(BenchTicker::new(1), now + Duration::from_micros(i * 100))
+            heap.insert(now + Duration::from_micros(i * 100), BenchInterval::new(1))
                 .unwrap();
         }
 
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i + 1);
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
         }
 
         // Measure
@@ -1164,13 +1164,13 @@ mod latency_tests {
             let poll_time = now + Duration::from_millis(WARMUP + i + 1);
 
             let start = Instant::now();
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
         }
 
-        print_histogram("Periodic Steady State (10 tickers @ 1ms)", &hist);
+        print_histogram("Periodic Steady State (10 intervals @ 1ms)", &hist);
     }
 
     // ==================== Realistic Heartbeat Scenario ====================
@@ -1178,7 +1178,7 @@ mod latency_tests {
     #[test]
     #[ignore]
     fn hdr_realistic_heartbeats() {
-        let mut heap: TickerHeap<BenchTicker, 32> = TickerHeap::new();
+        let mut heap: IntervalHeap<BenchInterval, 32> = IntervalHeap::new();
         let mut insert_hist = Histogram::<u64>::new(3).unwrap();
         let mut poll_hist = Histogram::<u64>::new(3).unwrap();
         let mut remove_hist = Histogram::<u64>::new(3).unwrap();
@@ -1189,19 +1189,19 @@ mod latency_tests {
         let mut handles = Vec::new();
         for i in 0..5 {
             let period = 10 + i * 5; // 10, 15, 20, 25, 30ms
-            let h = heap.insert(BenchTicker::new(period), now).unwrap();
+            let h = heap.insert(now, BenchInterval::new(period)).unwrap();
             handles.push(h);
         }
 
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i + 1);
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
 
-            // Occasionally add/remove a ticker (simulating venue connect/disconnect)
+            // Occasionally add/remove a interval (simulating venue connect/disconnect)
             // Keep adds and removes balanced
             if i % 1000 == 0 && handles.len() < 20 {
-                let h = heap.insert(BenchTicker::new(50), poll_time).unwrap();
+                let h = heap.insert(poll_time, BenchInterval::new(50)).unwrap();
                 handles.push(h);
             }
             if i % 1000 == 500 && handles.len() > 5 {
@@ -1217,20 +1217,20 @@ mod latency_tests {
 
             // Poll
             let start = Instant::now();
-            heap.poll(&mut ctx, poll_time);
+            heap.poll(poll_time, &mut ctx);
             poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
 
-            // Occasionally add ticker (venue reconnect)
+            // Occasionally add interval (venue reconnect)
             if i % 1000 == 0 && handles.len() < 20 {
                 let start = Instant::now();
-                let h = heap.insert(BenchTicker::new(50), poll_time).unwrap();
+                let h = heap.insert(poll_time, BenchInterval::new(50)).unwrap();
                 insert_hist
                     .record(start.elapsed().as_nanos() as u64)
                     .unwrap();
                 handles.push(h);
             }
 
-            // Occasionally remove ticker (venue disconnect)
+            // Occasionally remove interval (venue disconnect)
             if i % 1000 == 500 && handles.len() > 5 {
                 if let Some(h) = handles.pop() {
                     let start = Instant::now();
@@ -1252,7 +1252,7 @@ mod latency_tests {
     #[test]
     #[ignore]
     fn hdr_cancel_after_fires() {
-        let mut heap: TickerHeap<BenchTicker, 64> = TickerHeap::new();
+        let mut heap: IntervalHeap<BenchInterval, 64> = IntervalHeap::new();
         let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
         let now = Instant::now();
@@ -1260,21 +1260,21 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i);
-            let h = heap.insert(BenchTicker::new(1), poll_time).unwrap();
+            let h = heap.insert(poll_time, BenchInterval::new(1)).unwrap();
             // Fire it multiple times
-            heap.poll(&mut ctx, poll_time + Duration::from_millis(5));
+            heap.poll(poll_time + Duration::from_millis(5), &mut ctx);
             heap.remove(h);
         }
 
         // Measure: insert, let it fire several times, then cancel
         for i in 0..ITERATIONS {
             let base_time = now + Duration::from_millis(WARMUP + i * 10);
-            let h = heap.insert(BenchTicker::new(1), base_time).unwrap();
+            let h = heap.insert(base_time, BenchInterval::new(1)).unwrap();
 
             // Fire it 3 times
-            heap.poll(&mut ctx, base_time + Duration::from_millis(1));
-            heap.poll(&mut ctx, base_time + Duration::from_millis(2));
-            heap.poll(&mut ctx, base_time + Duration::from_millis(3));
+            heap.poll(base_time + Duration::from_millis(1), &mut ctx);
+            heap.poll(base_time + Duration::from_millis(2), &mut ctx);
+            heap.poll(base_time + Duration::from_millis(3), &mut ctx);
 
             // Now cancel with original handle
             let start = Instant::now();
