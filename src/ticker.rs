@@ -24,7 +24,9 @@ impl<T> Debug for InsertError<T> {
 
 pub trait Ticker {
     type Context;
+
     fn fire(&mut self, ctx: &mut Self::Context);
+
     fn period(&self) -> Duration;
 }
 
@@ -34,7 +36,7 @@ pub struct TickerHandle(pub(crate) u16);
 pub trait TickerDriver<T: Ticker> {
     fn insert(&mut self, ticker: T, now: Instant) -> Result<TickerHandle, InsertError<T>>;
     fn remove(&mut self, handle: TickerHandle) -> Option<T>;
-    fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize;
+    fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize;
     fn peek_next_fire(&self) -> Option<Instant>;
     fn is_active(&self, handle: TickerHandle) -> bool;
     fn len(&self) -> usize;
@@ -215,7 +217,7 @@ mod heap {
             Some(entry.ticker)
         }
 
-        fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize {
+        fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize {
             let mut fired = 0;
 
             while self.heap_len > 0 {
@@ -457,13 +459,13 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll at 60ms - only ticker 2 (50ms) should fire
-        let fired = heap.poll(now + Duration::from_millis(60), &mut ctx);
+        let fired = heap.poll(&mut ctx, now + Duration::from_millis(60));
         assert_eq!(fired, 1);
         assert_eq!(ctx, vec![2]);
 
         // Poll at 110ms - ticker 2 fires again (rescheduled to 110), ticker 1 fires (100)
         ctx.clear();
-        let fired = heap.poll(now + Duration::from_millis(110), &mut ctx);
+        let fired = heap.poll(&mut ctx, now + Duration::from_millis(110));
         assert_eq!(fired, 2);
         assert!(ctx.contains(&1));
         assert!(ctx.contains(&2));
@@ -546,7 +548,7 @@ mod tests {
         let now = Instant::now();
         let mut ctx = 0usize;
 
-        let fired = heap.poll(now, &mut ctx);
+        let fired = heap.poll(&mut ctx, now);
         assert_eq!(fired, 0);
         assert_eq!(ctx, 0);
     }
@@ -559,7 +561,7 @@ mod tests {
         heap.insert(CounterTicker::new(100), now).unwrap();
 
         let mut ctx = 0usize;
-        let fired = heap.poll(now + Duration::from_millis(50), &mut ctx);
+        let fired = heap.poll(&mut ctx, now + Duration::from_millis(50));
 
         assert_eq!(fired, 0);
         assert_eq!(ctx, 0);
@@ -573,7 +575,7 @@ mod tests {
         heap.insert(CounterTicker::new(100), now).unwrap();
 
         let mut ctx = 0usize;
-        let fired = heap.poll(now + Duration::from_millis(100), &mut ctx);
+        let fired = heap.poll(&mut ctx, now + Duration::from_millis(100));
 
         assert_eq!(fired, 1);
         assert_eq!(ctx, 1);
@@ -589,7 +591,7 @@ mod tests {
         let mut ctx = 0usize;
 
         // First fire at 100ms
-        heap.poll(now + Duration::from_millis(100), &mut ctx);
+        heap.poll(&mut ctx, now + Duration::from_millis(100));
         assert_eq!(ctx, 1);
         assert_eq!(heap.len(), 1); // Still in heap
 
@@ -598,7 +600,7 @@ mod tests {
         assert_eq!(next, now + Duration::from_millis(200));
 
         // Fire again at 200ms
-        heap.poll(now + Duration::from_millis(200), &mut ctx);
+        heap.poll(&mut ctx, now + Duration::from_millis(200));
         assert_eq!(ctx, 2);
     }
 
@@ -612,7 +614,7 @@ mod tests {
         let mut ctx = 0usize;
 
         // Poll at 250ms - fires once (no catch-up), reschedules to 300ms
-        let fired = heap.poll(now + Duration::from_millis(250), &mut ctx);
+        let fired = heap.poll(&mut ctx, now + Duration::from_millis(250));
         assert_eq!(fired, 1);
         assert_eq!(ctx, 1);
 
@@ -631,19 +633,19 @@ mod tests {
         let mut ctx = 0usize;
 
         // Poll incrementally - this is how it would be used in practice
-        heap.poll(now + Duration::from_millis(50), &mut ctx);
+        heap.poll(&mut ctx, now + Duration::from_millis(50));
         assert_eq!(ctx, 1);
 
-        heap.poll(now + Duration::from_millis(100), &mut ctx);
+        heap.poll(&mut ctx, now + Duration::from_millis(100));
         assert_eq!(ctx, 2);
 
-        heap.poll(now + Duration::from_millis(150), &mut ctx);
+        heap.poll(&mut ctx, now + Duration::from_millis(150));
         assert_eq!(ctx, 3);
 
-        heap.poll(now + Duration::from_millis(200), &mut ctx);
+        heap.poll(&mut ctx, now + Duration::from_millis(200));
         assert_eq!(ctx, 4);
 
-        heap.poll(now + Duration::from_millis(250), &mut ctx);
+        heap.poll(&mut ctx, now + Duration::from_millis(250));
         assert_eq!(ctx, 5);
     }
 
@@ -659,9 +661,9 @@ mod tests {
         let mut ctx = 0usize;
 
         // Fire multiple times
-        heap.poll(now + Duration::from_millis(100), &mut ctx);
-        heap.poll(now + Duration::from_millis(200), &mut ctx);
-        heap.poll(now + Duration::from_millis(300), &mut ctx);
+        heap.poll(&mut ctx, now + Duration::from_millis(100));
+        heap.poll(&mut ctx, now + Duration::from_millis(200));
+        heap.poll(&mut ctx, now + Duration::from_millis(300));
 
         // Handle still valid
         assert!(heap.is_active(handle));
@@ -833,7 +835,7 @@ mod tests {
         heap.insert(t3, now).unwrap();
 
         let mut ctx = Vec::new();
-        let fired = heap.poll(now + Duration::from_millis(100), &mut ctx);
+        let fired = heap.poll(&mut ctx, now + Duration::from_millis(100));
 
         assert_eq!(fired, 3);
         assert_eq!(ctx.len(), 3);
@@ -854,11 +856,11 @@ mod tests {
         let mut ctx = 0usize;
 
         // At now, nothing fires (fire_at = now + 1ms)
-        let fired = heap.poll(now, &mut ctx);
+        let fired = heap.poll(&mut ctx, now);
         assert_eq!(fired, 0);
 
         // At now + 1ms, it fires
-        let fired = heap.poll(now + Duration::from_millis(1), &mut ctx);
+        let fired = heap.poll(&mut ctx, now + Duration::from_millis(1));
         assert_eq!(fired, 1);
 
         // Reschedules to now + 2ms
@@ -917,7 +919,7 @@ mod tests {
 
         // Poll incrementally every 10ms for 100ms
         for i in 1..=10 {
-            heap.poll(now + Duration::from_millis(i * 10), &mut ctx);
+            heap.poll(&mut ctx, now + Duration::from_millis(i * 10));
         }
 
         // 10ms ticker: 10 fires (at 10,20,30,40,50,60,70,80,90,100)
@@ -1049,7 +1051,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i);
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
         }
 
         // Measure
@@ -1057,7 +1059,7 @@ mod latency_tests {
             let poll_time = now + Duration::from_millis(WARMUP + i);
 
             let start = Instant::now();
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1085,7 +1087,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i);
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
         }
 
         // Measure
@@ -1093,7 +1095,7 @@ mod latency_tests {
             let poll_time = now + Duration::from_millis(WARMUP + i);
 
             let start = Instant::now();
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1118,7 +1120,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i + 1);
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
         }
 
         // Measure
@@ -1126,7 +1128,7 @@ mod latency_tests {
             let poll_time = now + Duration::from_millis(WARMUP + i + 1);
 
             let start = Instant::now();
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1154,7 +1156,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i + 1);
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
         }
 
         // Measure
@@ -1162,7 +1164,7 @@ mod latency_tests {
             let poll_time = now + Duration::from_millis(WARMUP + i + 1);
 
             let start = Instant::now();
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1194,7 +1196,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let poll_time = now + Duration::from_millis(i + 1);
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
 
             // Occasionally add/remove a ticker (simulating venue connect/disconnect)
             // Keep adds and removes balanced
@@ -1215,7 +1217,7 @@ mod latency_tests {
 
             // Poll
             let start = Instant::now();
-            heap.poll(poll_time, &mut ctx);
+            heap.poll(&mut ctx, poll_time);
             poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
 
             // Occasionally add ticker (venue reconnect)
@@ -1260,7 +1262,7 @@ mod latency_tests {
             let poll_time = now + Duration::from_millis(i);
             let h = heap.insert(BenchTicker::new(1), poll_time).unwrap();
             // Fire it multiple times
-            heap.poll(poll_time + Duration::from_millis(5), &mut ctx);
+            heap.poll(&mut ctx, poll_time + Duration::from_millis(5));
             heap.remove(h);
         }
 
@@ -1270,9 +1272,9 @@ mod latency_tests {
             let h = heap.insert(BenchTicker::new(1), base_time).unwrap();
 
             // Fire it 3 times
-            heap.poll(base_time + Duration::from_millis(1), &mut ctx);
-            heap.poll(base_time + Duration::from_millis(2), &mut ctx);
-            heap.poll(base_time + Duration::from_millis(3), &mut ctx);
+            heap.poll(&mut ctx, base_time + Duration::from_millis(1));
+            heap.poll(&mut ctx, base_time + Duration::from_millis(2));
+            heap.poll(&mut ctx, base_time + Duration::from_millis(3));
 
             // Now cancel with original handle
             let start = Instant::now();
