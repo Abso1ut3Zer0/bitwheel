@@ -124,7 +124,7 @@ impl<
                 }
 
                 let mut timer = entry.remove();
-                timer.fire(ctx, now);
+                timer.fire(ctx);
                 fired_from_failover += 1;
             }
         }
@@ -193,7 +193,7 @@ mod tests {
     impl Timer for OneShotTimer {
         type Context = Vec<usize>;
 
-        fn fire(&mut self, ctx: &mut Self::Context, _now: Instant) {
+        fn fire(&mut self, ctx: &mut Self::Context) {
             self.fired.set(true);
             ctx.push(self.id);
         }
@@ -204,7 +204,7 @@ mod tests {
     impl Timer for CounterTimer {
         type Context = usize;
 
-        fn fire(&mut self, ctx: &mut Self::Context, _now: Instant) {
+        fn fire(&mut self, ctx: &mut Self::Context) {
             *ctx += 1;
         }
     }
@@ -983,7 +983,7 @@ mod tests {
 
         impl Timer for DropCounter {
             type Context = ();
-            fn fire(&mut self, _ctx: &mut (), _now: Instant) {}
+            fn fire(&mut self, _ctx: &mut ()) {}
         }
 
         let drop_count = Arc::new(AtomicUsize::new(0));
@@ -1010,7 +1010,7 @@ mod tests {
 
 #[cfg(test)]
 mod latency_tests {
-    use crate::timer::{WheelWithFailover, BurstWheelWithFailover};
+    use crate::timer::{BurstWheelWithFailover, WheelWithFailover};
 
     use super::*;
     use hdrhistogram::Histogram;
@@ -1024,7 +1024,7 @@ mod latency_tests {
     impl Timer for LatencyTimer {
         type Context = ();
 
-        fn fire(&mut self, _ctx: &mut (), _now: Instant) {}
+        fn fire(&mut self, _ctx: &mut ()) {}
     }
 
     fn print_histogram(name: &str, hist: &Histogram<u64>) {
