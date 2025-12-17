@@ -28,15 +28,35 @@ pub trait TimerDriver<T: Timer>: Default {
     /// if the wheel is at capacity.
     fn insert(&mut self, when: Instant, timer: T) -> Result<TimerHandle, Self::Err>;
 
-    /// Cancel a pending timer.
+    /// Remove and return a pending timer.
     ///
     /// Returns the timer if still pending, `None` if already fired or invalid handle.
-    fn cancel(&mut self, handle: TimerHandle) -> Option<T>;
+    fn remove(&mut self, handle: TimerHandle) -> Option<T>;
 
     /// Poll the wheel, firing all timers due by `now`.
     ///
     /// Returns the number of timers fired.
     fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize;
+
+    /// Peek at the next fire time without modifying state.
+    ///
+    /// Returns `None` if no timers are pending.
+    fn peek_next_fire(&self) -> Option<Instant>;
+
+    /// Number of pending timers.
+    fn len(&self) -> usize;
+
+    /// Cancel a pending timer.
+    ///
+    /// Returns `true` if the timer was found and cancelled.
+    fn cancel(&mut self, handle: TimerHandle) -> bool {
+        self.remove(handle).is_some()
+    }
+
+    /// Check if there are no pending timers.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl<T, const G: usize, const R: u64, const S: usize, const P: usize> TimerDriver<T>
@@ -52,13 +72,23 @@ where
     }
 
     #[inline(always)]
-    fn cancel(&mut self, handle: TimerHandle) -> Option<T> {
+    fn remove(&mut self, handle: TimerHandle) -> Option<T> {
         BitWheel::cancel(self, handle)
     }
 
     #[inline(always)]
     fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize {
         BitWheel::poll(self, now, ctx)
+    }
+
+    #[inline(always)]
+    fn peek_next_fire(&self) -> Option<Instant> {
+        BitWheel::peek_next_fire(self)
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        BitWheel::len(self)
     }
 }
 
@@ -69,20 +99,29 @@ where
 {
     type Err = Infallible;
 
-    /// Infallible insert - always succeeds, overflows to BTreeMap.
     #[inline(always)]
     fn insert(&mut self, when: Instant, timer: T) -> Result<TimerHandle, Self::Err> {
         Ok(BitWheelWithFailover::insert(self, when, timer))
     }
 
     #[inline(always)]
-    fn cancel(&mut self, handle: TimerHandle) -> Option<T> {
+    fn remove(&mut self, handle: TimerHandle) -> Option<T> {
         BitWheelWithFailover::cancel(self, handle)
     }
 
     #[inline(always)]
     fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize {
         BitWheelWithFailover::poll(self, now, ctx)
+    }
+
+    #[inline(always)]
+    fn peek_next_fire(&self) -> Option<Instant> {
+        BitWheelWithFailover::peek_next_fire(self)
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        BitWheelWithFailover::len(self)
     }
 }
 
