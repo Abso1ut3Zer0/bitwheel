@@ -289,13 +289,18 @@ impl<
             self.gear_next_fire[gear_idx] = self.compute_gear_min_fire(gear_idx);
         }
 
-        // Global min from cached values
-        self.next_fire_tick = None;
+        // Could use sentinel instead
+        let mut min_tick = u64::MAX;
         for &cached in &self.gear_next_fire {
             if let Some(tick) = cached {
-                self.next_fire_tick = Some(self.next_fire_tick.map_or(tick, |t| t.min(tick)));
+                min_tick = min_tick.min(tick);
             }
         }
+        self.next_fire_tick = if min_tick == u64::MAX {
+            None
+        } else {
+            Some(min_tick)
+        };
     }
 
     #[inline(always)]
@@ -322,14 +327,10 @@ impl<
         let shift = gear_idx * 6;
         let gear_period = 1u64 << (shift + 6);
         let slot_fire_offset = (slot as u64) << shift;
-
         let current_in_period = self.current_tick & (gear_period - 1);
-
-        if slot_fire_offset > current_in_period {
-            (self.current_tick & !(gear_period - 1)) + slot_fire_offset
-        } else {
-            (self.current_tick & !(gear_period - 1)) + gear_period + slot_fire_offset
-        }
+        let base = self.current_tick & !(gear_period - 1);
+        let passed = (slot_fire_offset <= current_in_period) as u64;
+        base + passed * gear_period + slot_fire_offset
     }
 
     #[inline(always)]
