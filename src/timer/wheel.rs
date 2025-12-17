@@ -25,6 +25,8 @@ pub struct BitWheel<
     // Cached min fire tick per gear + dirty tracking
     gear_next_fire: [Option<u64>; NUM_GEARS],
     gear_dirty: u64,
+
+    len: usize,
 }
 
 impl<
@@ -73,6 +75,7 @@ impl<
             next_fire_tick: None,
             gear_next_fire: [None; NUM_GEARS],
             gear_dirty: 0,
+            len: 0,
         }
     }
 
@@ -123,6 +126,17 @@ impl<
     }
 
     #[inline(always)]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Peek at the next fire time.
+    #[inline(always)]
+    pub fn peek_next_fire(&self) -> Option<Instant> {
+        self.next_fire_tick.map(|tick| self.tick_to_instant(tick))
+    }
+
+    #[inline(always)]
     pub fn duration_until_next(&self) -> Option<Duration> {
         self.next_fire_tick.map(|next| {
             let ticks_remaining = next.saturating_sub(self.current_tick);
@@ -154,6 +168,7 @@ impl<
             Some(self.gear_next_fire[gear_idx].map_or(fire_tick, |t| t.min(fire_tick)));
         self.next_fire_tick = Some(self.next_fire_tick.map_or(fire_tick, |t| t.min(fire_tick)));
 
+        self.len += 1;
         Ok(TimerHandle {
             when_offset: when_tick,
             key: key as u32,
@@ -194,7 +209,7 @@ impl<
 
         // Mark gear dirty - removed timer might have been the min
         self.gear_dirty |= 1 << gear_idx;
-
+        self.len = self.len.saturating_sub(1);
         Some(timer)
     }
 
@@ -351,6 +366,12 @@ impl<
     fn slot_for_tick(&self, gear: usize, tick: u64) -> usize {
         let shift = gear * 6;
         ((tick >> shift) & 63) as usize
+    }
+
+    /// Convert tick back to Instant.
+    #[inline(always)]
+    pub(crate) fn tick_to_instant(&self, tick: u64) -> Instant {
+        self.epoch + Duration::from_millis(tick << Self::RESOLUTION_SHIFT)
     }
 }
 

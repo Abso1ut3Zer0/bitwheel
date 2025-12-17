@@ -153,6 +153,29 @@ impl<
         }
     }
 
+    #[inline(always)]
+    pub fn peek_next_fire(&self) -> Option<Instant> {
+        let wheel_next = self.wheel.peek_next_fire();
+
+        if self.failover.is_empty() {
+            return wheel_next;
+        }
+
+        // Failover is checked every FAILOVER_INTERVAL ticks
+        let next_check_tick = (self.last_check + 1) * FAILOVER_INTERVAL;
+        let failover_check = self.wheel.tick_to_instant(next_check_tick);
+
+        match wheel_next {
+            Some(w) => Some(w.min(failover_check)),
+            None => Some(failover_check),
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.wheel.len() + self.failover.len()
+    }
+
     /// Timers currently in failover
     #[inline(always)]
     pub fn failover_len(&self) -> usize {
