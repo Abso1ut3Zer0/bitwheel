@@ -5,6 +5,13 @@ use std::{
 
 pub use heap::TickerHeap;
 
+pub type TickerHeap16<T> = TickerHeap<T, 16>;
+pub type TickerHeap32<T> = TickerHeap<T, 32>;
+pub type TickerHeap64<T> = TickerHeap<T, 64>;
+pub type TickerHeap128<T> = TickerHeap<T, 128>;
+pub type TickerHeap256<T> = TickerHeap<T, 256>;
+pub type TickerHeap512<T> = TickerHeap<T, 512>;
+
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("could not insert into ticker heap")]
 pub struct InsertError<T>(pub T);
