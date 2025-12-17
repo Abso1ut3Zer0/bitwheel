@@ -1,21 +1,26 @@
 # BitWheel
 
-A high-performance hierarchical timer wheel for Rust, optimized for consistent low-latency for event-driven applications.
+High-performance timer primitives for Rust, optimized for consistent low-latency in event-driven applications.
 
-## Features
+## Two Data Structures, Two Use Cases
 
-- **O(1) operations** — insert, cancel, and poll are constant-time regardless of timer count
-- **Predictable tail latency** — no cascading between gears eliminates latency spikes
-- **Zero allocation on hot path** — all memory pre-allocated; trades memory for determinism
-- **Bounded capacity by design** — insert failure signals backpressure, not a bug
-- **Failover option** — `BitWheelWithFailover` gracefully degrades to BTreeMap when full
-- **Dual-lane option** — `DualBitWheel` separates periodic and oneshot timers with independent configurations
-- **Precision tradeoff** — coarser gears sacrifice millisecond precision (does a 1-hour timer need it?)
-- **Compile-time configuration** — tune resolution, capacity, and range via const generics
+| | BitWheel | TickerHeap |
+|--|----------|------------|
+| **Purpose** | High-throughput ephemeral timers | Cancellable periodic tickers |
+| **Examples** | Order timeouts, rate limits, retries | Heartbeats, monitoring sweeps, metrics flush |
+| **Volume** | Thousands to millions | Tens to hundreds |
+| **Handle stability** | Invalid after fire | Stable until cancelled |
+| **Complexity** | O(1) insert/cancel/poll | O(log n) insert/remove, O(1) poll |
+
+**Use BitWheel when**: You need maximum throughput for short-lived timers that fire once and disappear.
+
+**Use TickerHeap when**: You need periodic callbacks with stable handles for cancellation.
 
 ## Quick Start
+
+### BitWheel — Ephemeral Timers
 ```rust
-use bitwheel::{BalancedWheel, Timer, TimerHandle};
+use bitwheel::{BitWheel, BalancedWheel, Timer};
 use std::time::{Duration, Instant};
 
 struct OrderTimeout {
@@ -25,78 +30,89 @@ struct OrderTimeout {
 impl Timer for OrderTimeout {
     type Context = Vec<u64>;
 
-    fn fire(&mut self, _now: Instant, ctx: &mut Self::Context) -> Option<Instant> {
+    fn fire(&mut self, _now: Instant, ctx: &mut Self::Context) {
         ctx.push(self.order_id);
-        None // one-shot
     }
 }
 
 fn main() {
-    let mut wheel: Box<BalancedWheel<OrderTimeout>> = BalancedWheel::boxed();
+    let mut wheel: Box<BalancedWheel<OrderTimeout>> = BitWheel::boxed();
     
     // Insert a timer
     let when = Instant::now() + Duration::from_millis(100);
     let handle = wheel.insert(when, OrderTimeout { order_id: 12345 }).unwrap();
     
-    // Cancel if order fills
+    // Cancel if order fills before timeout
     if let Some(timer) = wheel.cancel(handle) {
         println!("Cancelled order {}", timer.order_id);
     }
     
     // Poll in event loop
-    let mut fired = Vec::new();
-    wheel.poll(Instant::now(), &mut fired).unwrap();
+    let mut expired_orders = Vec::new();
+    wheel.poll(Instant::now(), &mut expired_orders).unwrap();
 }
 ```
 
-## Preconfigured Wheels
+### TickerHeap — Periodic Tickers
+```rust
+use bitwheel::TickerHeap;
+use std::time::{Duration, Instant};
 
-BitWheel provides type aliases for common use cases:
+fn main() {
+    let mut tickers: TickerHeap<(), 32> = TickerHeap::new();
+    
+    // Register a heartbeat ticker
+    let handle = tickers.insert(
+        Duration::from_secs(30),
+        Instant::now(),
+        |_ctx| println!("heartbeat"),
+    ).unwrap();
+    
+    // Poll in event loop — tickers automatically reschedule
+    tickers.poll(Instant::now(), &mut ());
+    
+    // Cancel when connection closes
+    tickers.remove(handle);
+}
+```
+
+## BitWheel
+
+### Features
+
+- **O(1) operations** — insert, cancel, and poll are constant-time regardless of timer count
+- **Predictable tail latency** — no cascading between gears eliminates latency spikes
+- **Zero allocation on hot path** — all memory pre-allocated; trades memory for determinism
+- **Bounded capacity by design** — insert failure signals backpressure, not a bug
+- **Failover option** — `BitWheelWithFailover` gracefully degrades to BTreeMap when full
+- **Compile-time configuration** — tune resolution, capacity, and range via const generics
+
+### Preconfigured Wheels
 
 | Type | Resolution | Range | Slot Cap | Use Case |
 |------|------------|-------|----------|----------|
-| `BalancedWheel` | 5ms | ~23 hours | 16 | General purpose |
-| `BalancedFastWheel` | 5ms | ~23 hours | 64 | Minimal probing |
-| `BalancedLightWheel` | 5ms | ~23 hours | 8 | Memory constrained |
+| `BalancedWheel` | 4ms | ~19 hours | 16 | General purpose |
+| `BalancedFastWheel` | 4ms | ~19 hours | 64 | Minimal probing |
+| `BalancedLightWheel` | 4ms | ~19 hours | 8 | Memory constrained |
 | `PreciseWheel` | 1ms | ~4.7 hours | 16 | Sub-10ms timeouts |
-| `BurstWheel` | 5ms | ~23 hours | 32 | High timer density |
+| `BurstWheel` | 4ms | ~19 hours | 32 | High timer density |
 | `ExtendedWheel` | 16ms | ~3 days | 16 | Long-running timers |
 
 Each has a `WithFailover` variant (e.g., `BalancedWheelWithFailover`) that falls back to BTreeMap on overflow.
+
 ```rust
-use bitwheel::{PreciseWheel, BurstWheelWithFailover};
+use bitwheel::{PreciseWheel, BurstWheelWithFailover, BitWheel, BitWheelWithFailover};
 
 // 1ms resolution for tight timeouts
-let mut precise: Box<PreciseWheel<MyTimer>> = PreciseWheel::boxed();
+let mut precise: Box<PreciseWheel<MyTimer>> = BitWheel::boxed();
 
 // High capacity with safety net
-let mut burst: Box<BurstWheelWithFailover<MyTimer>> = BurstWheelWithFailover::boxed();
+let mut burst: Box<BurstWheelWithFailover<MyTimer>> = BitWheelWithFailover::boxed();
 ```
 
-### Dual-Lane Wheels
+### Design Philosophy
 
-`DualBitWheel` runs two independent wheels — one for periodic timers (heartbeats, monitoring) and one for oneshot timers (order timeouts). Each lane has its own resolution and capacity tuning.
-
-| Type | Periodic | Oneshot | Use Case |
-|------|----------|---------|----------|
-| `StandardBalancedDualWheel` | 100ms / 8 cap | 5ms / 16 cap | General purpose |
-| `FastPreciseDualWheel` | 100ms / 16 cap | 1ms / 64 cap | HFT order timeouts |
-| `StandardBurstDualWheel` | 100ms / 8 cap | 5ms / 32 cap | Bursty workloads |
-```rust
-use bitwheel::{StandardBalancedDualWheel, DualBitWheel};
-
-let mut wheel: Box<StandardBalancedDualWheel<MyTimer>> = DualBitWheel::boxed();
-
-// Periodic timers (heartbeats) — coarse resolution, high probe tolerance
-let handle = wheel.insert_periodic(when, timer);
-
-// Oneshot timers (order timeouts) — fine resolution, tight latency
-let handle = wheel.insert_oneshot(when, timer);
-```
-
-## Design Philosophy
-
-### Insert Can Fail (And That's OK)
+#### Insert Can Fail (And That's OK)
 
 Unlike most timer implementations, `BitWheel::insert` returns `Result`. When slots overflow:
 ```rust
@@ -111,7 +127,7 @@ match wheel.insert(when, timer) {
 
 For systems where dropping timers is unacceptable, use `BitWheelWithFailover`:
 ```rust
-use bitwheel::BalancedWheelWithFailover;
+use bitwheel::{BalancedWheelWithFailover, BitWheelWithFailover};
 
 let mut wheel: Box<BalancedWheelWithFailover<MyTimer>> = 
     BitWheelWithFailover::boxed();
@@ -120,7 +136,7 @@ let mut wheel: Box<BalancedWheelWithFailover<MyTimer>> =
 let handle = wheel.insert(when, timer);
 ```
 
-### Precision vs. Predictability
+#### Precision vs. Predictability
 
 Traditional hierarchical wheels cascade timers between levels as time advances. This causes latency spikes when many timers move simultaneously.
 
@@ -129,7 +145,7 @@ BitWheel trades precision for predictability:
 - A 1-hour timer might fire within a ~64ms window — acceptable for most use cases
 - No cascading means no surprise latency spikes
 
-### Memory Tradeoff
+#### Memory Tradeoff
 
 BitWheel pre-allocates all slot storage at construction:
 
@@ -141,9 +157,9 @@ BitWheel pre-allocates all slot storage at construction:
 
 This trades memory for determinism — no allocator calls during insert/poll.
 
-## How It's Fast
+### How It's Fast
 
-**Hierarchical gear design**: 64 slots per gear, each gear 64× coarser than the previous. 4 gears cover ~4.6 hours at 5ms resolution.
+**Hierarchical gear design**: 64 slots per gear, each gear 64× coarser than the previous. 5 gears cover ~19 hours at 4ms resolution.
 
 **Skip-ahead optimization**: Tracks `next_fire_tick` globally. Empty polls jump directly to the next timer instead of iterating idle slots.
 
@@ -155,49 +171,9 @@ This trades memory for determinism — no allocator calls during insert/poll.
 
 **No cascading**: Timers stay in their original slot until they fire. Higher gears have lower precision, but zero overhead from timer migration.
 
-## Benchmarks
+**Power-of-2 arithmetic**: Resolution must be a power of 2, enabling bit shifts instead of division on the hot path.
 
-Measured with HDR histograms (100k warmup, 1M iterations, `--release`).
-
-### Interleaved Insert Latency
-
-Timers inserted between existing entries — stresses tree rebalancing and cascading.
-
-| Percentile | BitWheel | BitWheel+Failover | DualBitWheel | BTreeMap | HHWT |
-|------------|----------|-------------------|--------------|----------|------|
-| p50 | **26 ns** | 27 ns | 26 ns | 34 ns | 39 ns |
-| p90 | **28 ns** | 31 ns | 29 ns | 49 ns | 54 ns |
-| p99 | **34 ns** | 50 ns | 39 ns | 100 ns | 278 ns |
-| p99.9 | **48 ns** | 75 ns | 67 ns | 131 ns | 990 ns |
-| p99.99 | **131 ns** | 149 ns | 145 ns | 201 ns | 2415 ns |
-
-### Realistic Trading Simulation
-
-Order timeout management: 80% inserts, 5% cancels, continuous polling.
-
-| Operation | BitWheel | BitWheel+Failover | DualBitWheel | BTreeMap | HHWT |
-|-----------|----------|-------------------|--------------|----------|------|
-| Insert p50 | **26 ns** | 27 ns | 26 ns | 42 ns | 28 ns |
-| Insert p99.9 | **61 ns** | 66 ns | 66 ns | 79 ns | 87 ns |
-| Poll p50 | **15 ns** | 17 ns | 19 ns | 17 ns | 19 ns |
-| Poll p99.9 | **61 ns** | 65 ns | 67 ns | 149 ns | 1515 ns |
-| Cancel p50 | **14 ns** | 14 ns | 14 ns | 54 ns | 20 ns |
-| Cancel p99.9 | **33 ns** | 36 ns | 37 ns | 156 ns | 45 ns |
-
-### Summary
-
-| Metric | vs BTreeMap | vs HHWT |
-|--------|-------------|---------|
-| Insert | 1.4-1.7× faster | ~same p50, 2× better p99.9 |
-| Cancel | **3.6× faster** | 1.4× slower p50, similar tail |
-| Poll tail (p99.9) | **1.6× better** | **14× better** |
-| Predictability (stddev) | 2× better | 9× better |
-
-Comparisons:
-- **BTreeMap**: `BTreeMap<(u64, u32), T>` — similar to tokio's internal timer
-- **HHWT**: [hierarchical_hash_wheel_timer](https://crates.io/crates/hierarchical_hash_wheel_timer) v1.3
-
-## Advanced Configuration
+### Advanced Configuration
 ```rust
 use bitwheel::BitWheel;
 
@@ -208,7 +184,7 @@ type CustomWheel<T> = BitWheel<T, 4, 1, 64, 8>;
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `NUM_GEARS` | 5 | Hierarchy levels (more = longer max delay) |
-| `RESOLUTION_MS` | 5 | Base tick resolution in milliseconds |
+| `RESOLUTION_MS` | 4 | Base tick resolution in milliseconds (must be power of 2) |
 | `SLOT_CAP` | 32 | Timers per slot before probing |
 | `MAX_PROBES` | 3 | Linear probe distance on collision |
 
@@ -239,22 +215,161 @@ Each gear has 64 slots. When a slot fills to `SLOT_CAP`, inserts probe linearly 
 
 4. **Use failover** if drops are unacceptable: `BitWheelWithFailover` catches overflow in a BTreeMap
 
-## Event Loop Integration
+---
+
+## TickerHeap
+
+A min-heap for low-volume periodic tickers with stable handles.
+
+### Features
+
+- **Stable handles** — Handle remains valid through any number of fires until explicitly removed
+- **O(log n) insert/remove** — Heap operations scale logarithmically  
+- **O(1) poll** — Peek at min is constant time; fires are O(log n) each
+- **Zero allocation** — Fixed-capacity array, no heap alloc on hot path
+- **Automatic rescheduling** — Tickers reschedule themselves after firing
+- **Configurable capacity** — Const generic for compile-time sizing
+
+### API
 ```rust
-use bitwheel::{BalancedWheel, Timer};
+use bitwheel::TickerHeap;
 use std::time::{Duration, Instant};
 
-fn event_loop<T: Timer>(wheel: &mut BalancedWheel<T>, ctx: &mut T::Context) {
-    loop {
-        // Poll timers
-        if let Err(e) = wheel.poll(Instant::now(), ctx) {
-            eprintln!("{} timers failed to reschedule", e.0);
-        }
+// Create with capacity for 32 tickers
+let mut heap: TickerHeap<MyContext, 32> = TickerHeap::new();
+
+// Insert a ticker (period, first fire time, callback)
+let handle = heap.insert(
+    Duration::from_secs(30),
+    Instant::now() + Duration::from_secs(30),
+    |ctx| { /* heartbeat logic */ },
+).unwrap();
+
+// Poll fires due tickers and reschedules them
+let fired_count = heap.poll(Instant::now(), &mut ctx);
+
+// Remove when no longer needed
+heap.remove(handle);
+
+// Query state
+heap.is_active(handle);      // Check if handle is still valid
+heap.duration_until_next();  // Time until next fire
+heap.len();                  // Number of active tickers
+```
+
+### Typical Use Cases
+
+| Ticker | Period | Example |
+|--------|--------|---------|
+| Venue heartbeat | 30s | Exchange liveness check |
+| Position sweep | 1s | Reconciliation scan |
+| Metrics flush | 10s | Push to monitoring |
+| Connection keepalive | 60s | TCP keepalive |
+| Risk check | 100ms | Portfolio limits |
+
+### Capacity Guidelines
+
+TickerHeap is designed for small n (tens to low hundreds). For a trading system:
+
+```rust
+// Typical ticker inventory:
+// - 5 venue heartbeats
+// - 1 position sweep  
+// - 1 metrics flush
+// - 1 risk check
+// - ~10 spare
+// Total: ~20 tickers
+
+type TradingTickers<Ctx> = TickerHeap<Ctx, 32>;  // Comfortable headroom
+```
+
+---
+
+## Benchmarks
+
+Measured with HDR histograms (100k warmup, 1M iterations, `--release`).
+
+### BitWheel — Ephemeral Timer Performance
+
+#### Realistic Trading Simulation
+
+Order timeout management: 80% inserts, 5% cancels, continuous polling.
+
+| Operation | BitWheel | BitWheel+Failover | BTreeMap | HHWT |
+|-----------|----------|-------------------|----------|------|
+| Insert p50 | **24 ns** | 27 ns | 42 ns | 28 ns |
+| Insert p99.9 | **61 ns** | 66 ns | 79 ns | 87 ns |
+| Poll p50 | **15 ns** | 17 ns | 17 ns | 19 ns |
+| Poll p99.9 | **61 ns** | 65 ns | 149 ns | 1515 ns |
+| Cancel p50 | **14 ns** | 14 ns | 54 ns | 20 ns |
+| Cancel p99.9 | **33 ns** | 36 ns | 156 ns | 45 ns |
+
+#### Interleaved Insert Latency
+
+Timers inserted between existing entries — stresses tree rebalancing.
+
+| Percentile | BitWheel | BitWheel+Failover | BTreeMap | HHWT |
+|------------|----------|-------------------|----------|------|
+| p50 | **26 ns** | 27 ns | 34 ns | 39 ns |
+| p90 | **28 ns** | 31 ns | 49 ns | 54 ns |
+| p99 | **34 ns** | 50 ns | 100 ns | 278 ns |
+| p99.9 | **48 ns** | 75 ns | 131 ns | 990 ns |
+| p99.99 | **131 ns** | 149 ns | 201 ns | 2415 ns |
+
+### TickerHeap — Periodic Ticker Performance
+
+#### Heartbeat Scenario (5 venue heartbeats, continuous operation)
+
+| Operation | p50 | p99 | p99.9 |
+|-----------|-----|-----|-------|
+| Insert | 15 ns | 35 ns | 53 ns |
+| Poll | 12 ns | 99 ns | 134 ns |
+| Remove | 15 ns | 30 ns | 52 ns |
+
+#### Steady State (10 tickers firing @ 1ms)
+
+| Percentile | Latency |
+|------------|---------|
+| p50 | 119 ns |
+| p90 | 181 ns |
+| p99 | 192 ns |
+| p99.9 | 631 ns |
+
+Comparisons:
+- **BTreeMap**: `BTreeMap<(u64, u32), T>` - similar usage on async runtimes
+- **HHWT**: [hierarchical_hash_wheel_timer](https://crates.io/crates/hierarchical_hash_wheel_timer) v1.3
+
+---
+
+## Event Loop Integration
+```rust
+use bitwheel::{BitWheel, BalancedWheel, TickerHeap, Timer};
+use std::time::{Duration, Instant};
+
+struct TimerSystem<T: Timer> {
+    wheel: Box<BalancedWheel<T>>,
+    tickers: TickerHeap<T::Context, 32>,
+}
+
+impl<T: Timer> TimerSystem<T> {
+    fn poll(&mut self, now: Instant, ctx: &mut T::Context) {
+        // Poll tickers first (heartbeats are time-critical)
+        self.tickers.poll(now, ctx);
         
-        // Sleep until next timer or max interval
-        match wheel.duration_until_next() {
-            Some(d) => std::thread::sleep(d.min(Duration::from_millis(100))),
-            None => std::thread::sleep(Duration::from_millis(100)),
+        // Then ephemeral timers
+        if let Err(e) = self.wheel.poll(now, ctx) {
+            eprintln!("{} timers lost to overflow", e.0);
+        }
+    }
+    
+    fn duration_until_next(&self) -> Option<Duration> {
+        let wheel_next = self.wheel.duration_until_next();
+        let ticker_next = self.tickers.duration_until_next();
+        
+        match (wheel_next, ticker_next) {
+            (Some(w), Some(t)) => Some(w.min(t)),
+            (Some(d), None) | (None, Some(d)) => Some(d),
+            (None, None) => None,
         }
     }
 }

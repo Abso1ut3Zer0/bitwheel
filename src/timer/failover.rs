@@ -103,16 +103,11 @@ impl<
         }
     }
 
-    pub fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize
+    pub fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize
     where
         T: Timer,
     {
-        let fired_from_wheel = self.wheel.poll_with_failover(now, ctx, |when, timer| {
-            let sequence = self.sequence;
-            self.sequence = self.sequence.wrapping_add(1);
-            self.failover.insert((when, sequence), timer);
-        });
-
+        let fired_from_wheel = self.wheel.poll(ctx, now);
         let mut fired_from_failover = 0;
 
         // Check failover every FAILOVER_INTERVAL ticks
@@ -129,11 +124,8 @@ impl<
                 }
 
                 let mut timer = entry.remove();
+                timer.fire(ctx, now);
                 fired_from_failover += 1;
-
-                if let Some(next_when) = timer.fire(now, ctx) {
-                    let _ = self.insert(next_when, timer);
-                }
             }
         }
 
@@ -174,7 +166,8 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    // One lap = 64 ticks. At 1ms resolution, that's 64ms.
+    // One lap = 64 ticks at 1ms resolution = 64ms
+    // Failover interval = 32 ticks at 1ms = 32ms
     const ONE_LAP_MS: u64 = 64;
 
     // ==================== Test Timer Implementations ====================
@@ -200,43 +193,9 @@ mod tests {
     impl Timer for OneShotTimer {
         type Context = Vec<usize>;
 
-        fn fire(&mut self, _now: Instant, ctx: &mut Self::Context) -> Option<Instant> {
+        fn fire(&mut self, ctx: &mut Self::Context, _now: Instant) {
             self.fired.set(true);
             ctx.push(self.id);
-            None
-        }
-    }
-
-    struct PeriodicTimer {
-        id: usize,
-        period: Duration,
-        max_fires: usize,
-        fire_count: usize,
-    }
-
-    impl PeriodicTimer {
-        fn new(id: usize, period: Duration, max_fires: usize) -> Self {
-            Self {
-                id,
-                period,
-                max_fires,
-                fire_count: 0,
-            }
-        }
-    }
-
-    impl Timer for PeriodicTimer {
-        type Context = Vec<(usize, usize)>;
-
-        fn fire(&mut self, now: Instant, ctx: &mut Self::Context) -> Option<Instant> {
-            self.fire_count += 1;
-            ctx.push((self.id, self.fire_count));
-
-            if self.fire_count < self.max_fires {
-                Some(now + self.period)
-            } else {
-                None
-            }
         }
     }
 
@@ -245,9 +204,8 @@ mod tests {
     impl Timer for CounterTimer {
         type Context = usize;
 
-        fn fire(&mut self, _now: Instant, ctx: &mut Self::Context) -> Option<Instant> {
+        fn fire(&mut self, ctx: &mut Self::Context, _now: Instant) {
             *ctx += 1;
-            None
         }
     }
 
@@ -279,7 +237,7 @@ mod tests {
     // ==================== Insert Tests ====================
 
     #[test]
-    fn test_insert_goes_to_wheel() {
+    fn test_insert_single() {
         let epoch = Instant::now();
         let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -288,8 +246,23 @@ mod tests {
         let handle = wheel.insert(epoch + Duration::from_millis(100), timer);
 
         assert!(!wheel.is_empty());
-        assert!(!handle.overflow);
+        assert!(!handle.overflow); // went to wheel, not failover
         assert_eq!(wheel.failover_len(), 0);
+    }
+
+    #[test]
+    fn test_insert_updates_next_fire() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
+            BitWheelWithFailover::boxed_with_epoch(epoch);
+
+        assert!(wheel.duration_until_next().is_none());
+
+        let (timer, _) = OneShotTimer::new(1);
+        wheel.insert(epoch + Duration::from_millis(50), timer);
+
+        let duration = wheel.duration_until_next().unwrap();
+        assert!(duration.as_millis() <= 50);
     }
 
     #[test]
@@ -323,7 +296,7 @@ mod tests {
 
         let when = epoch + Duration::from_millis(10);
 
-        // Insert 100 timers - none should fail
+        // Insert 100 timers - none should fail (infallible insert)
         for _ in 0..100 {
             let _handle = wheel.insert(when, CounterTimer);
         }
@@ -356,6 +329,28 @@ mod tests {
         assert!(h3.overflow);
         assert_eq!(h2.key, 0);
         assert_eq!(h3.key, 1);
+    }
+
+    #[test]
+    fn test_insert_gear_selection() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
+            BitWheelWithFailover::boxed_with_epoch(epoch);
+
+        // Gear 0: delays 1-63
+        let (t1, _) = OneShotTimer::new(1);
+        let h1 = wheel.insert(epoch + Duration::from_millis(30), t1);
+        assert_eq!(h1.gear, 0);
+
+        // Gear 1: delays 64-4095
+        let (t2, _) = OneShotTimer::new(2);
+        let h2 = wheel.insert(epoch + Duration::from_millis(100), t2);
+        assert_eq!(h2.gear, 1);
+
+        // Gear 2: delays 4096+
+        let (t3, _) = OneShotTimer::new(3);
+        let h3 = wheel.insert(epoch + Duration::from_millis(5000), t3);
+        assert_eq!(h3.gear, 2);
     }
 
     // ==================== Cancel Tests ====================
@@ -399,6 +394,24 @@ mod tests {
     }
 
     #[test]
+    fn test_cancel_after_poll_returns_none() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
+            BitWheelWithFailover::boxed_with_epoch(epoch);
+
+        let (timer, _) = OneShotTimer::new(1);
+        let handle = wheel.insert(epoch + Duration::from_millis(10), timer);
+
+        // Poll past the timer's deadline
+        let mut ctx = Vec::new();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
+
+        // Timer already fired, cancel should return None
+        let cancelled = wheel.cancel(handle);
+        assert!(cancelled.is_none());
+    }
+
+    #[test]
     fn test_cancel_wrong_handle_returns_none() {
         let epoch = Instant::now();
         let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 1, 1>> =
@@ -434,16 +447,67 @@ mod tests {
     // ==================== Poll Tests ====================
 
     #[test]
-    fn test_poll_empty() {
+    fn test_poll_no_timers() {
         let epoch = Instant::now();
         let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         let mut ctx = Vec::new();
-        let fired = wheel.poll(epoch + Duration::from_millis(100), &mut ctx);
+        let fired = wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
 
         assert_eq!(fired, 0);
         assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn test_poll_before_deadline() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
+            BitWheelWithFailover::boxed_with_epoch(epoch);
+
+        let (timer, fired) = OneShotTimer::new(1);
+        wheel.insert(epoch + Duration::from_millis(100), timer);
+
+        let mut ctx = Vec::new();
+        let result = wheel.poll(&mut ctx, epoch + Duration::from_millis(50));
+
+        assert_eq!(result, 0);
+        assert!(!fired.get());
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn test_poll_at_deadline() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
+            BitWheelWithFailover::boxed_with_epoch(epoch);
+
+        let (timer, fired) = OneShotTimer::new(1);
+        wheel.insert(epoch + Duration::from_millis(10), timer);
+
+        let mut ctx = Vec::new();
+        let result = wheel.poll(&mut ctx, epoch + Duration::from_millis(10));
+
+        assert_eq!(result, 1);
+        assert!(fired.get());
+        assert_eq!(ctx, vec![1]);
+    }
+
+    #[test]
+    fn test_poll_after_deadline() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
+            BitWheelWithFailover::boxed_with_epoch(epoch);
+
+        let (timer, fired) = OneShotTimer::new(1);
+        wheel.insert(epoch + Duration::from_millis(10), timer);
+
+        let mut ctx = Vec::new();
+        let result = wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
+
+        assert_eq!(result, 1);
+        assert!(fired.get());
+        assert_eq!(ctx, vec![1]);
     }
 
     #[test]
@@ -456,7 +520,7 @@ mod tests {
         wheel.insert(epoch + Duration::from_millis(10), timer);
 
         let mut ctx = Vec::new();
-        let fired = wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
+        let fired = wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
 
         assert_eq!(fired, 1);
         assert!(fired_flag.get());
@@ -465,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn test_poll_fires_from_failover_after_lap() {
+    fn test_poll_fires_from_failover_after_interval() {
         let epoch = Instant::now();
         let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 1, 1>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -483,14 +547,14 @@ mod tests {
 
         let mut ctx = Vec::new();
 
-        // Poll at 20ms - wheel timer fires, but failover not drained yet (no lap boundary crossed)
-        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
+        // Poll at 20ms - wheel timer fires, but failover not drained yet
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
         assert!(f1.get());
         assert!(!f2.get()); // failover not drained yet
         assert_eq!(wheel.failover_len(), 1);
 
-        // Poll past lap boundary (64ms) - failover drains
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS + 10), &mut ctx);
+        // Poll past failover interval boundary (32ms) - failover drains
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
         assert!(f2.get());
         assert_eq!(wheel.failover_len(), 0);
         assert!(wheel.is_empty());
@@ -515,14 +579,75 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll at 20ms - before interval boundary, failover should NOT drain
-        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
         assert!(!f2.get());
         assert_eq!(wheel.failover_len(), 1);
 
         // Poll at 31ms - still before interval boundary
-        wheel.poll(epoch + Duration::from_millis(31), &mut ctx);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(31));
         assert!(!f2.get());
         assert_eq!(wheel.failover_len(), 1);
+    }
+
+    #[test]
+    fn test_poll_multiple_timers_same_slot() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
+            BitWheelWithFailover::boxed_with_epoch(epoch);
+
+        let when = epoch + Duration::from_millis(10);
+        let (t1, f1) = OneShotTimer::new(1);
+        let (t2, f2) = OneShotTimer::new(2);
+        let (t3, f3) = OneShotTimer::new(3);
+
+        wheel.insert(when, t1);
+        wheel.insert(when, t2);
+        wheel.insert(when, t3);
+
+        let mut ctx = Vec::new();
+        let result = wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
+
+        assert_eq!(result, 3);
+        assert!(f1.get());
+        assert!(f2.get());
+        assert!(f3.get());
+        assert_eq!(ctx.len(), 3);
+    }
+
+    #[test]
+    fn test_poll_multiple_timers_different_times() {
+        let epoch = Instant::now();
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
+            BitWheelWithFailover::boxed_with_epoch(epoch);
+
+        let (t1, f1) = OneShotTimer::new(1);
+        let (t2, f2) = OneShotTimer::new(2);
+        let (t3, f3) = OneShotTimer::new(3);
+
+        wheel.insert(epoch + Duration::from_millis(10), t1);
+        wheel.insert(epoch + Duration::from_millis(20), t2);
+        wheel.insert(epoch + Duration::from_millis(30), t3);
+
+        // Poll at 15ms - only first should fire
+        let mut ctx = Vec::new();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(15));
+        assert!(f1.get());
+        assert!(!f2.get());
+        assert!(!f3.get());
+        assert_eq!(ctx, vec![1]);
+
+        // Poll at 25ms - second should fire
+        ctx.clear();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(25));
+        assert!(f2.get());
+        assert!(!f3.get());
+        assert_eq!(ctx, vec![2]);
+
+        // Poll at 35ms - third should fire
+        ctx.clear();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
+        assert!(f3.get());
+        assert_eq!(ctx, vec![3]);
     }
 
     #[test]
@@ -541,104 +666,51 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll at 15ms - fires wheel timer only
-        wheel.poll(epoch + Duration::from_millis(15), &mut ctx);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(15));
         assert!(f1.get());
         assert!(!f2.get());
 
-        // Poll past lap boundary - fires failover timer
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS + 10), &mut ctx);
+        // Poll past interval boundary - fires failover timer
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
         assert!(f2.get());
 
         assert!(wheel.is_empty());
     }
 
     #[test]
-    fn test_poll_before_deadline_no_fire() {
+    fn test_poll_clears_is_empty() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 1, 1>> =
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
-        let when = epoch + Duration::from_millis(100);
-
-        // One in wheel, one in failover
-        let (t1, f1) = OneShotTimer::new(1);
-        wheel.insert(when, t1);
-
-        let (t2, f2) = OneShotTimer::new(2);
-        wheel.insert(when, t2);
-
-        let mut ctx = Vec::new();
-        let fired = wheel.poll(epoch + Duration::from_millis(50), &mut ctx);
-
-        assert_eq!(fired, 0);
-        assert!(!f1.get());
-        assert!(!f2.get());
-    }
-
-    // ==================== Periodic Timer Tests ====================
-
-    #[test]
-    fn test_periodic_reschedules_to_wheel() {
-        let epoch = Instant::now();
-        let mut wheel: Box<BitWheelWithFailover<PeriodicTimer, 4, 1, 32, 3>> =
-            BitWheelWithFailover::boxed_with_epoch(epoch);
-
-        let timer = PeriodicTimer::new(1, Duration::from_millis(10), 3);
+        let (timer, _) = OneShotTimer::new(1);
         wheel.insert(epoch + Duration::from_millis(10), timer);
+        assert!(!wheel.is_empty());
 
         let mut ctx = Vec::new();
-
-        // Fire 1
-        wheel.poll(epoch + Duration::from_millis(15), &mut ctx);
-        assert_eq!(ctx, vec![(1, 1)]);
-        assert!(!wheel.is_empty());
-        assert_eq!(wheel.failover_len(), 0); // reschedule went to wheel
-
-        // Fire 2
-        wheel.poll(epoch + Duration::from_millis(30), &mut ctx);
-        assert_eq!(ctx, vec![(1, 1), (1, 2)]);
-
-        // Fire 3 (last)
-        wheel.poll(epoch + Duration::from_millis(45), &mut ctx);
-        assert_eq!(ctx, vec![(1, 1), (1, 2), (1, 3)]);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
         assert!(wheel.is_empty());
     }
 
     #[test]
-    fn test_periodic_in_failover_fires_on_lap_boundary() {
+    fn test_poll_same_instant_twice() {
         let epoch = Instant::now();
-        let mut wheel: Box<BitWheelWithFailover<PeriodicTimer, 4, 1, 1, 1>> =
+        let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 32, 3>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
-        let when = epoch + Duration::from_millis(10);
-
-        // Fill wheel
-        let blocker = PeriodicTimer::new(99, Duration::from_millis(1000), 1);
-        wheel.insert(when, blocker);
-
-        // Periodic goes to failover
-        let timer = PeriodicTimer::new(1, Duration::from_millis(100), 3);
-        let handle = wheel.insert(when, timer);
-        assert!(handle.overflow);
+        let (timer, _) = OneShotTimer::new(1);
+        wheel.insert(epoch + Duration::from_millis(10), timer);
 
         let mut ctx = Vec::new();
+        let now = epoch + Duration::from_millis(20);
 
-        // Poll at 20ms - wheel timer fires, failover not yet
-        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
-        assert!(ctx.contains(&(99, 1)));
-        assert!(!ctx.contains(&(1, 1)));
+        // First poll fires the timer
+        let r1 = wheel.poll(&mut ctx, now);
+        assert_eq!(r1, 1);
 
-        // Poll past first lap - failover fires
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS + 10), &mut ctx);
-        assert!(ctx.contains(&(1, 1)));
-
-        // Poll past second lap - second fire
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS * 2 + 10), &mut ctx);
-        assert!(ctx.contains(&(1, 2)));
-
-        // Poll past third lap - third fire
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS * 3 + 10), &mut ctx);
-        assert!(ctx.contains(&(1, 3)));
+        // Second poll at same instant should be no-op
+        let r2 = wheel.poll(&mut ctx, now);
+        assert_eq!(r2, 0);
     }
 
     // ==================== Duration Until Next Tests ====================
@@ -727,9 +799,9 @@ mod tests {
         wheel.insert(when, t3);
         assert_eq!(wheel.failover_len(), 2);
 
-        // Poll past lap boundary drains failover
+        // Poll past interval boundary drains failover
         let mut ctx = Vec::new();
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS + 10), &mut ctx);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
         assert_eq!(wheel.failover_len(), 0);
     }
 
@@ -748,7 +820,7 @@ mod tests {
         assert!(!wheel.is_empty());
 
         let mut ctx = Vec::new();
-        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
         assert!(wheel.is_empty());
     }
 
@@ -770,13 +842,13 @@ mod tests {
 
         assert!(!wheel.is_empty());
 
-        // Poll fires wheel timer but not failover
+        // Poll fires wheel timer but not failover (before interval)
         let mut ctx = Vec::new();
-        wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
         assert!(!wheel.is_empty()); // failover still has timer
 
-        // Poll past lap boundary fires failover
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS + 10), &mut ctx);
+        // Poll past interval boundary fires failover
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
         assert!(wheel.is_empty());
     }
 
@@ -788,7 +860,7 @@ mod tests {
         let mut wheel: Box<BitWheelWithFailover<CounterTimer, 4, 1, 32, 8>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
-        // Insert 1000 timers - many will overflow
+        // Insert 1000 timers - many will overflow to failover
         for i in 0..1000 {
             let delay = (i % 50) + 1; // delays 1-50ms
             wheel.insert(epoch + Duration::from_millis(delay as u64), CounterTimer);
@@ -796,8 +868,8 @@ mod tests {
 
         let mut count = 0usize;
 
-        // Poll past multiple laps to ensure all failover timers drain
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS * 3), &mut count);
+        // Poll past multiple intervals to ensure all failover timers drain
+        wheel.poll(&mut count, epoch + Duration::from_millis(ONE_LAP_MS * 3));
 
         assert_eq!(count, 1000);
         assert!(wheel.is_empty());
@@ -829,13 +901,13 @@ mod tests {
         assert_eq!(h3.key, u32::MAX);
         assert_eq!(h4.key, 0); // wrapped
 
-        // All should still fire (poll past lap boundary)
+        // All should still fire (poll past interval boundary)
         let mut count = 0usize;
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS + 10), &mut count);
+        wheel.poll(&mut count, epoch + Duration::from_millis(35));
         assert_eq!(count, 5);
     }
 
-    // ==================== Lap Boundary Tests ====================
+    // ==================== Interval Boundary Tests ====================
 
     #[test]
     fn test_failover_drains_at_interval_boundary() {
@@ -856,40 +928,41 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll at 31ms - just before interval boundary
-        wheel.poll(epoch + Duration::from_millis(31), &mut ctx);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(31));
         assert!(!f2.get());
         assert_eq!(wheel.failover_len(), 1);
 
         // Poll at 32ms - crosses interval boundary, failover drains
-        wheel.poll(epoch + Duration::from_millis(32), &mut ctx);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(32));
         assert!(f2.get());
         assert_eq!(wheel.failover_len(), 0);
     }
+
     #[test]
-    fn test_multiple_lap_boundaries() {
+    fn test_multiple_interval_boundaries() {
         let epoch = Instant::now();
         let mut wheel: Box<BitWheelWithFailover<OneShotTimer, 4, 1, 1, 1>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         let mut ctx = Vec::new();
 
-        // Insert and fire across multiple laps
-        for lap in 0..5 {
-            let when = epoch + Duration::from_millis(lap * ONE_LAP_MS + 10);
+        // Insert and fire across multiple intervals
+        for interval in 0..5 {
+            let when = epoch + Duration::from_millis(interval * 32 + 10);
 
             // Fill wheel
-            let (t1, _) = OneShotTimer::new(lap as usize * 2);
+            let (t1, _) = OneShotTimer::new(interval as usize * 2);
             wheel.insert(when, t1);
 
             // Goes to failover
-            let (t2, _) = OneShotTimer::new(lap as usize * 2 + 1);
+            let (t2, _) = OneShotTimer::new(interval as usize * 2 + 1);
             wheel.insert(when, t2);
         }
 
-        // Poll through all laps
-        wheel.poll(epoch + Duration::from_millis(ONE_LAP_MS * 6), &mut ctx);
+        // Poll through all intervals
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(200));
 
-        assert_eq!(ctx.len(), 10); // 5 laps × 2 timers
+        assert_eq!(ctx.len(), 10); // 5 intervals × 2 timers
         assert!(wheel.is_empty());
     }
 
@@ -910,9 +983,7 @@ mod tests {
 
         impl Timer for DropCounter {
             type Context = ();
-            fn fire(&mut self, _now: Instant, _ctx: &mut ()) -> Option<Instant> {
-                None
-            }
+            fn fire(&mut self, _ctx: &mut (), _now: Instant) {}
         }
 
         let drop_count = Arc::new(AtomicUsize::new(0));
@@ -953,50 +1024,7 @@ mod latency_tests {
     impl Timer for LatencyTimer {
         type Context = ();
 
-        fn fire(&mut self, _now: Instant, _ctx: &mut ()) -> Option<Instant> {
-            None
-        }
-    }
-
-    struct PeriodicLatencyTimer {
-        period: Duration,
-        remaining: usize,
-    }
-
-    impl Timer for PeriodicLatencyTimer {
-        type Context = ();
-
-        fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
-            self.remaining = self.remaining.saturating_sub(1);
-            if self.remaining > 0 {
-                Some(now + self.period)
-            } else {
-                None
-            }
-        }
-    }
-
-    enum MixedLatencyTimer {
-        OneShot,
-        Periodic { period: Duration, remaining: usize },
-    }
-
-    impl Timer for MixedLatencyTimer {
-        type Context = ();
-
-        fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
-            match self {
-                MixedLatencyTimer::OneShot => None,
-                MixedLatencyTimer::Periodic { period, remaining } => {
-                    *remaining = remaining.saturating_sub(1);
-                    if *remaining > 0 {
-                        Some(now + *period)
-                    } else {
-                        None
-                    }
-                }
-            }
-        }
+        fn fire(&mut self, _ctx: &mut (), _now: Instant) {}
     }
 
     fn print_histogram(name: &str, hist: &Histogram<u64>) {
@@ -1015,7 +1043,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_insert_latency_failover() {
+    fn hdr_insert_latency() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -1046,7 +1074,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_cancel_latency_failover() {
+    fn hdr_cancel_latency() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -1077,7 +1105,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_empty_failover() {
+    fn hdr_poll_empty() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -1088,7 +1116,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
         }
 
         // Measure
@@ -1096,7 +1124,7 @@ mod latency_tests {
             let now = epoch + Duration::from_millis(i);
 
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1107,7 +1135,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_pending_no_fires_failover() {
+    fn hdr_poll_pending_no_fires() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -1124,7 +1152,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
         }
 
         // Measure
@@ -1132,7 +1160,7 @@ mod latency_tests {
             let now = epoch + Duration::from_millis(i);
 
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1143,7 +1171,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_single_fire_failover() {
+    fn hdr_poll_single_fire() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -1156,7 +1184,7 @@ mod latency_tests {
             let when = epoch + Duration::from_millis(i + 1);
             let _ = wheel.insert(when, LatencyTimer);
             let now = epoch + Duration::from_millis(i + 1);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
         }
 
         // Measure: insert timer, advance time, poll fires it
@@ -1168,7 +1196,7 @@ mod latency_tests {
             let now = epoch + Duration::from_millis(tick + 1);
 
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1179,157 +1207,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_periodic_steady_state_failover() {
-        let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<PeriodicLatencyTimer>> =
-            BitWheelWithFailover::boxed_with_epoch(epoch);
-
-        let mut hist = Histogram::<u64>::new(3).unwrap();
-        let mut ctx = ();
-
-        // 10 periodic timers, 1ms period (fires every tick)
-        for i in 0..10 {
-            let when = epoch + Duration::from_millis(i + 1);
-            let timer = PeriodicLatencyTimer {
-                period: Duration::from_millis(1),
-                remaining: usize::MAX,
-            };
-            let _ = wheel.insert(when, timer);
-        }
-
-        // Warmup
-        for i in 0..WARMUP {
-            let now = epoch + Duration::from_millis(i + 1);
-            let _ = wheel.poll(now, &mut ctx);
-        }
-
-        // Measure
-        for i in WARMUP..(WARMUP + ITERATIONS) {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
-            let elapsed = start.elapsed().as_nanos() as u64;
-
-            hist.record(elapsed).unwrap();
-        }
-
-        print_histogram("Periodic Steady State (10 timers @ 1ms)", &hist);
-    }
-
-    #[test]
-    #[ignore]
-    fn hdr_mixed_periodic_oneshot_failover() {
-        let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<MixedLatencyTimer>> =
-            BitWheelWithFailover::boxed_with_epoch(epoch);
-
-        let mut hist = Histogram::<u64>::new(3).unwrap();
-        let mut ctx = ();
-
-        // 10 periodic heartbeats, 10ms period
-        for i in 0..10 {
-            let when = epoch + Duration::from_millis(i + 10);
-            let timer = MixedLatencyTimer::Periodic {
-                period: Duration::from_millis(10),
-                remaining: usize::MAX,
-            };
-            let _ = wheel.insert(when, timer);
-        }
-
-        // Warmup
-        for i in 0..WARMUP {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            // Insert 2 one-shot timers per tick (order timeouts)
-            for j in 0..2 {
-                let when = now + Duration::from_millis(50 + (i + j) % 50);
-                let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
-            }
-
-            let _ = wheel.poll(now, &mut ctx);
-        }
-
-        // Measure
-        for i in WARMUP..(WARMUP + ITERATIONS) {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            // Insert 2 one-shot timers per tick
-            for j in 0..2 {
-                let when = now + Duration::from_millis(50 + (i + j) % 50);
-                let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
-            }
-
-            let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
-            let elapsed = start.elapsed().as_nanos() as u64;
-
-            hist.record(elapsed).unwrap();
-        }
-
-        print_histogram("Mixed (10 periodic + 2 oneshot/tick)", &hist);
-    }
-
-    #[test]
-    #[ignore]
-    fn hdr_bursty_workload_failover() {
-        let epoch = Instant::now();
-        let mut wheel: Box<BurstWheelWithFailover<MixedLatencyTimer>> =
-            BitWheelWithFailover::boxed_with_epoch(epoch);
-
-        let mut hist = Histogram::<u64>::new(3).unwrap();
-        let mut ctx = ();
-
-        // 10 periodic heartbeats, 10ms period
-        for i in 0..10 {
-            let when = epoch + Duration::from_millis(i + 10);
-            let timer = MixedLatencyTimer::Periodic {
-                period: Duration::from_millis(10),
-                remaining: usize::MAX,
-            };
-            let _ = wheel.insert(when, timer);
-        }
-
-        // Warmup
-        for i in 0..WARMUP {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            // Burst every 100 ticks
-            if i % 100 == 0 {
-                for j in 0..50 {
-                    let when = now + Duration::from_millis(20 + j % 80);
-                    let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
-                }
-            }
-
-            let _ = wheel.poll(now, &mut ctx);
-        }
-
-        // Measure
-        for i in WARMUP..(WARMUP + ITERATIONS) {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            // Burst every 100 ticks
-            if i % 100 == 0 {
-                for j in 0..50 {
-                    let when = now + Duration::from_millis(20 + j % 80);
-                    let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
-                }
-            }
-
-            let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
-            let elapsed = start.elapsed().as_nanos() as u64;
-
-            hist.record(elapsed).unwrap();
-        }
-
-        print_histogram("Bursty (10 periodic + 50 burst every 100ms)", &hist);
-    }
-
-    #[test]
-    #[ignore]
-    fn hdr_trading_simulation_failover() {
+    fn hdr_trading_simulation() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -1345,7 +1223,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             now += Duration::from_millis(1);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
 
             if i % 5 != 0 {
                 let when = now + Duration::from_millis(50 + (i % 200));
@@ -1368,7 +1246,7 @@ mod latency_tests {
 
             // Poll
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
             poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
 
             // Insert 80%
@@ -1405,95 +1283,54 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_realistic_trading_failover() {
+    fn hdr_bursty_workload() {
         let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<MixedLatencyTimer>> =
+        let mut wheel: Box<BurstWheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
-        let mut insert_hist = Histogram::<u64>::new(3).unwrap();
-        let mut poll_hist = Histogram::<u64>::new(3).unwrap();
-        let mut cancel_hist = Histogram::<u64>::new(3).unwrap();
-
-        let mut handles = Vec::with_capacity(100);
+        let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
-        let mut now = epoch;
-
-        // Background: 5 venue heartbeats @ 30s period
-        for i in 0..5 {
-            let when = epoch + Duration::from_secs(30) + Duration::from_millis(i * 100);
-            let timer = MixedLatencyTimer::Periodic {
-                period: Duration::from_secs(30),
-                remaining: usize::MAX,
-            };
-            let _ = wheel.insert(when, timer);
-        }
 
         // Warmup
         for i in 0..WARMUP {
-            now += Duration::from_millis(1);
-            let _ = wheel.poll(now, &mut ctx);
+            let now = epoch + Duration::from_millis(i + 1);
 
-            // 80% of ticks: new order timeout (50-250ms)
-            if i % 5 != 0 {
-                let when = now + Duration::from_millis(50 + (i % 200));
-                let handle = wheel.insert(when, MixedLatencyTimer::OneShot);
-                if handles.len() < 100 {
-                    handles.push(handle);
+            // Burst every 100 ticks
+            if i % 100 == 0 {
+                for j in 0..50 {
+                    let when = now + Duration::from_millis(20 + j % 80);
+                    let _ = wheel.insert(when, LatencyTimer);
                 }
             }
 
-            // 5% of ticks: order filled, cancel timeout
-            if i % 20 == 0 {
-                if let Some(handle) = handles.pop() {
-                    let _ = wheel.cancel(handle);
-                }
-            }
+            wheel.poll(&mut ctx, now);
         }
 
         // Measure
-        for i in 0..ITERATIONS {
-            now += Duration::from_millis(1);
+        for i in WARMUP..(WARMUP + ITERATIONS) {
+            let now = epoch + Duration::from_millis(i + 1);
 
-            // Poll (always)
+            // Burst every 100 ticks
+            if i % 100 == 0 {
+                for j in 0..50 {
+                    let when = now + Duration::from_millis(20 + j % 80);
+                    let _ = wheel.insert(when, LatencyTimer);
+                }
+            }
+
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
-            poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
+            wheel.poll(&mut ctx, now);
+            let elapsed = start.elapsed().as_nanos() as u64;
 
-            // Insert order timeout 80%
-            if i % 5 != 0 {
-                let when = now + Duration::from_millis(50 + (i % 200));
-
-                let start = Instant::now();
-                let handle = wheel.insert(when, MixedLatencyTimer::OneShot);
-                insert_hist
-                    .record(start.elapsed().as_nanos() as u64)
-                    .unwrap();
-
-                if handles.len() < 100 {
-                    handles.push(handle);
-                }
-            }
-
-            // Cancel 5% (order filled)
-            if i % 20 == 0 {
-                if let Some(handle) = handles.pop() {
-                    let start = Instant::now();
-                    let _ = wheel.cancel(handle);
-                    cancel_hist
-                        .record(start.elapsed().as_nanos() as u64)
-                        .unwrap();
-                }
-            }
+            hist.record(elapsed).unwrap();
         }
 
-        print_histogram("Realistic Trading - Insert (order timeout)", &insert_hist);
-        print_histogram("Realistic Trading - Poll", &poll_hist);
-        print_histogram("Realistic Trading - Cancel (order fill)", &cancel_hist);
+        print_histogram("Bursty (50 burst every 100ms)", &hist);
     }
 
     #[test]
     #[ignore]
-    fn hdr_interleaved_insert_failover() {
+    fn hdr_interleaved_insert() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
@@ -1511,7 +1348,7 @@ mod latency_tests {
         // Warmup - insert timers that land BETWEEN existing entries
         for i in 0..WARMUP {
             now += Duration::from_millis(1);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
 
             let base = 100 + ((i % 990) * 10);
             let when = epoch + Duration::from_millis(base + 5);
@@ -1521,7 +1358,7 @@ mod latency_tests {
         // Measure - every insert lands between two existing timers
         for i in 0..ITERATIONS {
             now += Duration::from_millis(1);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
 
             // Replenish the "grid" timers as they fire
             if i % 10 == 0 {

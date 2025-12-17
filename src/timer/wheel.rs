@@ -1,12 +1,12 @@
 use std::time::{Duration, Instant};
 
 use crate::timer::{
-    PollError, Timer, TimerHandle,
+    Timer, TimerHandle,
     gear::{Gear, InsertError, NUM_SLOTS, SLOT_MASK},
 };
 
 pub const DEFAULT_GEARS: usize = 5;
-pub const DEFAULT_RESOLUTION_MS: u64 = 5;
+pub const DEFAULT_RESOLUTION_MS: u64 = 4;
 pub const DEFAULT_SLOT_CAP: usize = 32;
 pub const DEFAULT_MAX_PROBES: usize = 3;
 
@@ -48,11 +48,17 @@ impl<
     const MAX_PROBES: usize,
 > BitWheel<T, NUM_GEARS, RESOLUTION_MS, SLOT_CAP, MAX_PROBES>
 {
+    const RESOLUTION_SHIFT: u32 = RESOLUTION_MS.trailing_zeros();
+
     pub fn with_epoch(epoch: Instant) -> Self {
         const {
             assert!(NUM_GEARS >= 1, "must have at least one gear");
             assert!(NUM_GEARS <= 64, "cannot have more than 64 gears");
             assert!(RESOLUTION_MS >= 1, "resolution must be at least 1ms");
+            assert!(
+                RESOLUTION_MS.is_power_of_two(),
+                "resolution must be a power of 2"
+            );
             assert!(
                 6 * NUM_GEARS + (64 - RESOLUTION_MS.leading_zeros() as usize) <= 64,
                 "configuration would overflow u64 - reduce NUM_GEARS or RESOLUTION_MS"
@@ -192,45 +198,14 @@ impl<
         Some(timer)
     }
 
-    pub fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> Result<usize, PollError>
-    where
-        T: Timer,
-    {
-        let mut lost = 0usize;
-        let fired = self.poll_with_failover(now, ctx, |_, _| {
-            lost += 1;
-        });
-
-        if lost > 0 {
-            Err(PollError(lost))
-        } else {
-            Ok(fired)
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn poll_with_failover(
-        &mut self,
-        now: Instant,
-        ctx: &mut T::Context,
-        mut failover: impl FnMut(u64, T),
-    ) -> usize
+    pub fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize
     where
         T: Timer,
     {
         let target_tick = self.instant_to_tick(now);
-
         if target_tick <= self.current_tick {
             return 0;
         }
-
-        // Fast path: empty wheel, just advance time
-        if self.is_empty() {
-            self.current_tick = target_tick;
-            return 0;
-        }
-
-        let mut fired = 0usize;
 
         // Skip-ahead optimization
         match self.next_fire_tick {
@@ -249,10 +224,9 @@ impl<
             }
         }
 
+        let mut fired = 0;
         for tick in (self.current_tick + 1)..=target_tick {
-            self.poll_tick(tick, now, ctx, &mut fired, |when, timer| {
-                failover(when, timer)
-            });
+            fired += self.poll_tick(tick, now, ctx);
         }
 
         self.current_tick = target_tick;
@@ -261,16 +235,11 @@ impl<
     }
 
     #[inline(always)]
-    fn poll_tick(
-        &mut self,
-        tick: u64,
-        now: Instant,
-        ctx: &mut T::Context,
-        fired: &mut usize,
-        mut failover: impl FnMut(u64, T),
-    ) where
+    fn poll_tick(&mut self, tick: u64, now: Instant, ctx: &mut T::Context) -> usize
+    where
         T: Timer,
     {
+        let mut fired = 0;
         for gear_idx in 0..NUM_GEARS {
             if gear_idx > 0 {
                 let mask = (1u64 << (6 * gear_idx)) - 1;
@@ -280,10 +249,10 @@ impl<
             }
 
             let slot = self.slot_for_tick(gear_idx, tick);
-            self.drain_and_fire(gear_idx, slot, now, ctx, fired, |when, timer| {
-                failover(when, timer)
-            });
+            fired += self.drain_and_fire(gear_idx, slot, now, ctx);
         }
+
+        fired
     }
 
     #[inline(always)]
@@ -293,79 +262,21 @@ impl<
         slot: usize,
         now: Instant,
         ctx: &mut T::Context,
-        fired: &mut usize,
-        mut failover: impl FnMut(u64, T),
-    ) where
+    ) -> usize
+    where
         T: Timer,
     {
-        loop {
-            let mut timer = {
-                let guard = self.gears[gear_idx].acquire(slot);
-                match guard.pop() {
-                    Some(t) => t,
-                    None => break,
-                }
-            };
-
+        let mut fired = 0;
+        let guard = self.gears[gear_idx].acquire(slot);
+        while let Some(mut timer) = guard.pop() {
             // Mark gear dirty since we removed a timer
             self.gear_dirty |= 1 << gear_idx;
 
-            *fired += 1;
-
-            if let Some(next_when) = timer.fire(now, ctx) {
-                let when_tick = self.instant_to_tick(next_when);
-                if let Err(InsertError(timer)) =
-                    self.insert_excluding(when_tick, timer, gear_idx, slot)
-                {
-                    failover(when_tick, timer);
-                }
-            }
+            fired += 1;
+            timer.fire(ctx, now);
         }
-    }
 
-    #[inline(always)]
-    fn insert_excluding(
-        &mut self,
-        when_tick: u64,
-        timer: T,
-        excluded_gear: usize,
-        excluded_slot: usize,
-    ) -> Result<TimerHandle, InsertError<T>> {
-        let delay = when_tick.saturating_sub(self.current_tick).max(1);
-
-        let gear_idx = self.gear_for_delay(delay);
-        let target_slot = self.slot_for_tick(gear_idx, when_tick);
-
-        let result = if gear_idx == excluded_gear {
-            self.gears[gear_idx].acquire_next_available_excluding(
-                excluded_slot,
-                target_slot,
-                MAX_PROBES,
-            )
-        } else {
-            self.gears[gear_idx].acquire_next_available(target_slot, MAX_PROBES)
-        };
-
-        let Ok(guard) = result else {
-            return Err(InsertError(timer));
-        };
-
-        let actual_slot = guard.slot();
-        let key = guard.insert(timer);
-
-        // Compute actual fire tick and update caches
-        let fire_tick = self.compute_fire_tick(gear_idx, actual_slot);
-        self.gear_next_fire[gear_idx] =
-            Some(self.gear_next_fire[gear_idx].map_or(fire_tick, |t| t.min(fire_tick)));
-        self.next_fire_tick = Some(self.next_fire_tick.map_or(fire_tick, |t| t.min(fire_tick)));
-
-        Ok(TimerHandle {
-            when_offset: when_tick,
-            key: key as u32,
-            gear: gear_idx as u8,
-            slot: actual_slot as u8,
-            overflow: false,
-        })
+        fired
     }
 
     #[inline(always)]
@@ -378,13 +289,18 @@ impl<
             self.gear_next_fire[gear_idx] = self.compute_gear_min_fire(gear_idx);
         }
 
-        // Global min from cached values
-        self.next_fire_tick = None;
+        // Could use sentinel instead
+        let mut min_tick = u64::MAX;
         for &cached in &self.gear_next_fire {
             if let Some(tick) = cached {
-                self.next_fire_tick = Some(self.next_fire_tick.map_or(tick, |t| t.min(tick)));
+                min_tick = min_tick.min(tick);
             }
         }
+        self.next_fire_tick = if min_tick == u64::MAX {
+            None
+        } else {
+            Some(min_tick)
+        };
     }
 
     #[inline(always)]
@@ -411,19 +327,15 @@ impl<
         let shift = gear_idx * 6;
         let gear_period = 1u64 << (shift + 6);
         let slot_fire_offset = (slot as u64) << shift;
-
         let current_in_period = self.current_tick & (gear_period - 1);
-
-        if slot_fire_offset > current_in_period {
-            (self.current_tick & !(gear_period - 1)) + slot_fire_offset
-        } else {
-            (self.current_tick & !(gear_period - 1)) + gear_period + slot_fire_offset
-        }
+        let base = self.current_tick & !(gear_period - 1);
+        let passed = (slot_fire_offset <= current_in_period) as u64;
+        base + passed * gear_period + slot_fire_offset
     }
 
     #[inline(always)]
     pub(crate) fn instant_to_tick(&self, when: Instant) -> u64 {
-        when.saturating_duration_since(self.epoch).as_millis() as u64 / RESOLUTION_MS
+        when.saturating_duration_since(self.epoch).as_millis() as u64 >> Self::RESOLUTION_SHIFT
     }
 
     #[inline(always)]
@@ -436,6 +348,7 @@ impl<
         if delay == 0 {
             return 0;
         }
+
         let gear = (63 - delay.leading_zeros()) as usize / 6;
         gear.min(NUM_GEARS - 1)
     }
@@ -477,44 +390,9 @@ mod tests {
     impl Timer for OneShotTimer {
         type Context = Vec<usize>;
 
-        fn fire(&mut self, _now: Instant, ctx: &mut Self::Context) -> Option<Instant> {
+        fn fire(&mut self, ctx: &mut Self::Context, _now: Instant) {
             self.fired.set(true);
             ctx.push(self.id);
-            None // one-shot, no reschedule
-        }
-    }
-
-    /// Periodic timer that reschedules itself.
-    struct PeriodicTimer {
-        id: usize,
-        period: Duration,
-        max_fires: usize,
-        fire_count: usize,
-    }
-
-    impl PeriodicTimer {
-        fn new(id: usize, period: Duration, max_fires: usize) -> Self {
-            Self {
-                id,
-                period,
-                max_fires,
-                fire_count: 0,
-            }
-        }
-    }
-
-    impl Timer for PeriodicTimer {
-        type Context = Vec<(usize, usize)>; // (id, fire_count)
-
-        fn fire(&mut self, now: Instant, ctx: &mut Self::Context) -> Option<Instant> {
-            self.fire_count += 1;
-            ctx.push((self.id, self.fire_count));
-
-            if self.fire_count < self.max_fires {
-                Some(now + self.period)
-            } else {
-                None
-            }
         }
     }
 
@@ -524,9 +402,8 @@ mod tests {
     impl Timer for CounterTimer {
         type Context = usize;
 
-        fn fire(&mut self, _now: Instant, ctx: &mut Self::Context) -> Option<Instant> {
+        fn fire(&mut self, ctx: &mut Self::Context, _now: Instant) {
             *ctx += 1;
-            None
         }
     }
 
@@ -556,7 +433,7 @@ mod tests {
     #[test]
     fn test_custom_config() {
         // 4 gears, 10ms resolution, 16 slots, 5 max probes
-        let wheel: Box<BitWheel<OneShotTimer, 4, 10, 16, 5>> = BitWheel::boxed();
+        let wheel: Box<BitWheel<OneShotTimer, 4, 8, 16, 5>> = BitWheel::boxed();
         assert!(wheel.is_empty());
     }
 
@@ -708,7 +585,7 @@ mod tests {
 
         // Advance current_tick by polling
         let mut ctx = Vec::new();
-        let _ = wheel.poll(epoch + Duration::from_millis(100), &mut ctx);
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
 
         // Insert timer "in the past" - should get delay of 1 (minimum)
         let (timer, _) = OneShotTimer::new(1);
@@ -749,9 +626,7 @@ mod tests {
 
         // Poll past the timer's deadline
         let mut ctx = Vec::new();
-        wheel
-            .poll(epoch + Duration::from_millis(100), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
 
         // Timer already fired, cancel should return None
         let cancelled = wheel.cancel(handle);
@@ -766,9 +641,9 @@ mod tests {
         let mut wheel: Box<BitWheel<OneShotTimer, 4, 1, 32, 3>> = BitWheel::boxed_with_epoch(epoch);
 
         let mut ctx = Vec::new();
-        let result = wheel.poll(epoch + Duration::from_millis(100), &mut ctx);
+        let fired = wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
 
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(fired, 0);
         assert!(ctx.is_empty());
     }
 
@@ -783,9 +658,9 @@ mod tests {
             .unwrap();
 
         let mut ctx = Vec::new();
-        let result = wheel.poll(epoch + Duration::from_millis(50), &mut ctx);
+        let count = wheel.poll(&mut ctx, epoch + Duration::from_millis(50));
 
-        assert_eq!(result.unwrap(), 0);
+        assert_eq!(count, 0);
         assert!(!fired.get());
         assert!(ctx.is_empty());
     }
@@ -801,9 +676,9 @@ mod tests {
             .unwrap();
 
         let mut ctx = Vec::new();
-        let result = wheel.poll(epoch + Duration::from_millis(10), &mut ctx);
+        let count = wheel.poll(&mut ctx, epoch + Duration::from_millis(10));
 
-        assert_eq!(result.unwrap(), 1);
+        assert_eq!(count, 1);
         assert!(fired.get());
         assert_eq!(ctx, vec![1]);
     }
@@ -819,9 +694,9 @@ mod tests {
             .unwrap();
 
         let mut ctx = Vec::new();
-        let result = wheel.poll(epoch + Duration::from_millis(100), &mut ctx);
+        let count = wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
 
-        assert_eq!(result.unwrap(), 1);
+        assert_eq!(count, 1);
         assert!(fired.get());
         assert_eq!(ctx, vec![1]);
     }
@@ -841,9 +716,9 @@ mod tests {
         wheel.insert(when, t3).unwrap();
 
         let mut ctx = Vec::new();
-        let result = wheel.poll(epoch + Duration::from_millis(20), &mut ctx);
+        let count = wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
 
-        assert_eq!(result.unwrap(), 3);
+        assert_eq!(count, 3);
         assert!(f1.get());
         assert!(f2.get());
         assert!(f3.get());
@@ -865,9 +740,7 @@ mod tests {
 
         // Poll at 15ms - only first should fire
         let mut ctx = Vec::new();
-        wheel
-            .poll(epoch + Duration::from_millis(15), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(15));
         assert!(f1.get());
         assert!(!f2.get());
         assert!(!f3.get());
@@ -875,18 +748,14 @@ mod tests {
 
         // Poll at 25ms - second should fire
         ctx.clear();
-        wheel
-            .poll(epoch + Duration::from_millis(25), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(25));
         assert!(f2.get());
         assert!(!f3.get());
         assert_eq!(ctx, vec![2]);
 
         // Poll at 35ms - third should fire
         ctx.clear();
-        wheel
-            .poll(epoch + Duration::from_millis(35), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(35));
         assert!(f3.get());
         assert_eq!(ctx, vec![3]);
     }
@@ -903,9 +772,7 @@ mod tests {
         assert!(!wheel.is_empty());
 
         let mut ctx = Vec::new();
-        wheel
-            .poll(epoch + Duration::from_millis(100), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
         assert!(wheel.is_empty());
     }
 
@@ -926,74 +793,11 @@ mod tests {
 
         // Poll to fire first timer
         let mut ctx = Vec::new();
-        wheel
-            .poll(epoch + Duration::from_millis(20), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(20));
 
         // After poll, next fire should be ~50ms from epoch, minus current position
         let d2 = wheel.duration_until_next().unwrap();
         assert!(d2.as_millis() <= 30); // 50 - 20 = 30
-    }
-
-    // ==================== Periodic Timer Tests ====================
-
-    #[test]
-    fn test_periodic_timer_reschedules() {
-        let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<PeriodicTimer, 4, 1, 32, 3>> =
-            BitWheel::boxed_with_epoch(epoch);
-
-        let timer = PeriodicTimer::new(1, Duration::from_millis(10), 3);
-        wheel
-            .insert(epoch + Duration::from_millis(10), timer)
-            .unwrap();
-
-        let mut ctx = Vec::new();
-
-        // First fire at 10ms
-        wheel
-            .poll(epoch + Duration::from_millis(15), &mut ctx)
-            .unwrap();
-        assert_eq!(ctx, vec![(1, 1)]);
-
-        // Second fire at ~25ms (15 + 10)
-        wheel
-            .poll(epoch + Duration::from_millis(30), &mut ctx)
-            .unwrap();
-        assert_eq!(ctx, vec![(1, 1), (1, 2)]);
-
-        // Third fire at ~40ms (30 + 10) - last one
-        wheel
-            .poll(epoch + Duration::from_millis(45), &mut ctx)
-            .unwrap();
-        assert_eq!(ctx, vec![(1, 1), (1, 2), (1, 3)]);
-
-        // No more fires
-        wheel
-            .poll(epoch + Duration::from_millis(100), &mut ctx)
-            .unwrap();
-        assert_eq!(ctx.len(), 3);
-        assert!(wheel.is_empty());
-    }
-
-    #[test]
-    fn test_periodic_timer_exclusion() {
-        let epoch = Instant::now();
-        // Small slot cap to test exclusion behavior
-        let mut wheel: Box<BitWheel<PeriodicTimer, 4, 1, 2, 10>> =
-            BitWheel::boxed_with_epoch(epoch);
-
-        // Timer that reschedules to ~same slot
-        let timer = PeriodicTimer::new(1, Duration::from_millis(1), 5);
-        wheel
-            .insert(epoch + Duration::from_millis(1), timer)
-            .unwrap();
-
-        let mut ctx = Vec::new();
-
-        // Should not infinite loop - exclusion prevents re-inserting to draining slot
-        let result = wheel.poll(epoch + Duration::from_millis(10), &mut ctx);
-        assert!(result.is_ok());
     }
 
     // ==================== Gear Rotation Tests ====================
@@ -1014,9 +818,7 @@ mod tests {
 
         // Poll each tick individually
         for i in 1..=5 {
-            wheel
-                .poll(epoch + Duration::from_millis(i), &mut count)
-                .unwrap();
+            wheel.poll(&mut count, epoch + Duration::from_millis(i));
         }
 
         assert_eq!(count, 5);
@@ -1035,9 +837,7 @@ mod tests {
         let mut count = 0usize;
 
         // Poll at tick 100
-        wheel
-            .poll(epoch + Duration::from_millis(100), &mut count)
-            .unwrap();
+        wheel.poll(&mut count, epoch + Duration::from_millis(100));
         assert_eq!(count, 1);
     }
 
@@ -1056,15 +856,11 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll before - should not fire
-        wheel
-            .poll(epoch + Duration::from_millis(4000), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(4000));
         assert!(!fired.get());
 
         // Poll at/after deadline - should fire
-        wheel
-            .poll(epoch + Duration::from_millis(5100), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(5100));
         assert!(fired.get());
     }
 
@@ -1084,11 +880,11 @@ mod tests {
         let now = epoch + Duration::from_millis(20);
 
         // First poll fires the timer
-        let r1 = wheel.poll(now, &mut ctx).unwrap();
+        let r1 = wheel.poll(&mut ctx, now);
         assert_eq!(r1, 1);
 
         // Second poll at same instant should be no-op
-        let r2 = wheel.poll(now, &mut ctx).unwrap();
+        let r2 = wheel.poll(&mut ctx, now);
         assert_eq!(r2, 0);
     }
 
@@ -1105,15 +901,11 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Advance to 100ms
-        wheel
-            .poll(epoch + Duration::from_millis(100), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(100));
         assert!(fired.get());
 
         // "Go back" to 30ms - should be no-op (target_tick <= current_tick)
-        let r = wheel
-            .poll(epoch + Duration::from_millis(30), &mut ctx)
-            .unwrap();
+        let r = wheel.poll(&mut ctx, epoch + Duration::from_millis(30));
         assert_eq!(r, 0);
     }
 
@@ -1132,9 +924,7 @@ mod tests {
         }
 
         let mut count = 0usize;
-        wheel
-            .poll(epoch + Duration::from_millis(1000), &mut count)
-            .unwrap();
+        wheel.poll(&mut count, epoch + Duration::from_millis(1000));
 
         assert_eq!(count, 1000);
         assert!(wheel.is_empty());
@@ -1231,9 +1021,7 @@ mod tests {
 
         impl Timer for DropCounter {
             type Context = ();
-            fn fire(&mut self, _now: Instant, _ctx: &mut ()) -> Option<Instant> {
-                None
-            }
+            fn fire(&mut self, _ctx: &mut (), _now: Instant) {}
         }
 
         let drop_count = Arc::new(AtomicUsize::new(0));
@@ -1272,9 +1060,7 @@ mod tests {
 
         // Advance past slot 60
         let mut ctx = Vec::new();
-        wheel
-            .poll(epoch + Duration::from_millis(61), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(61));
 
         // Insert timer in slot 5 (wraps around)
         let (t2, _) = OneShotTimer::new(2);
@@ -1307,41 +1093,12 @@ mod tests {
         let mut ctx = Vec::new();
 
         // Poll far enough to fire all
-        wheel
-            .poll(epoch + Duration::from_millis(6000), &mut ctx)
-            .unwrap();
+        wheel.poll(&mut ctx, epoch + Duration::from_millis(6000));
 
         assert!(f1.get());
         assert!(f2.get());
         assert!(f3.get());
         assert_eq!(ctx.len(), 3);
-    }
-
-    #[test]
-    fn test_poll_error_on_reschedule_failure() {
-        let epoch = Instant::now();
-        // Tiny config: 1 slot cap, 1 max probe - reschedule will fail
-        let mut wheel: Box<BitWheel<PeriodicTimer, 4, 1, 1, 1>> = BitWheel::boxed_with_epoch(epoch);
-
-        // Periodic timer at tick 10, will reschedule to tick 16 when fired with now=15ms
-        let timer = PeriodicTimer::new(1, Duration::from_millis(1), 2);
-        wheel
-            .insert(epoch + Duration::from_millis(10), timer)
-            .unwrap();
-
-        // Blocker at tick 16 (slot 16) - blocks the reschedule target
-        // Won't fire yet (poll only goes to tick 15)
-        let blocker = PeriodicTimer::new(99, Duration::from_millis(1000), 1);
-        wheel
-            .insert(epoch + Duration::from_millis(16), blocker)
-            .unwrap();
-
-        let mut ctx = Vec::new();
-        let result = wheel.poll(epoch + Duration::from_millis(15), &mut ctx);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.0 > 0);
     }
 
     #[test]
@@ -1391,41 +1148,6 @@ mod tests {
     }
 
     #[test]
-    fn test_periodic_crosses_gear_boundary() {
-        let epoch = Instant::now();
-        let mut wheel: Box<BitWheel<PeriodicTimer, 4, 1, 32, 3>> =
-            BitWheel::boxed_with_epoch(epoch);
-
-        // Start in gear 0, reschedule with large period that lands in gear 1
-        let timer = PeriodicTimer::new(1, Duration::from_millis(100), 3);
-        wheel
-            .insert(epoch + Duration::from_millis(10), timer)
-            .unwrap();
-
-        let mut ctx = Vec::new();
-
-        // Fire 1: at ~10ms, reschedules to ~110ms (gear 1)
-        wheel
-            .poll(epoch + Duration::from_millis(15), &mut ctx)
-            .unwrap();
-        assert_eq!(ctx.len(), 1);
-
-        // Fire 2: at ~110ms, reschedules to ~210ms (gear 1)
-        wheel
-            .poll(epoch + Duration::from_millis(115), &mut ctx)
-            .unwrap();
-        assert_eq!(ctx.len(), 2);
-
-        // Fire 3: at ~210ms, no reschedule
-        wheel
-            .poll(epoch + Duration::from_millis(215), &mut ctx)
-            .unwrap();
-        assert_eq!(ctx.len(), 3);
-
-        assert!(wheel.is_empty());
-    }
-
-    #[test]
     fn test_zero_delay_goes_to_gear0() {
         let epoch = Instant::now();
         let wheel: Box<BitWheel<OneShotTimer, 4, 1, 32, 3>> = BitWheel::boxed_with_epoch(epoch);
@@ -1460,50 +1182,7 @@ mod latency_tests {
     impl Timer for LatencyTimer {
         type Context = ();
 
-        fn fire(&mut self, _now: Instant, _ctx: &mut ()) -> Option<Instant> {
-            None
-        }
-    }
-
-    struct PeriodicLatencyTimer {
-        period: Duration,
-        remaining: usize,
-    }
-
-    impl Timer for PeriodicLatencyTimer {
-        type Context = ();
-
-        fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
-            self.remaining = self.remaining.saturating_sub(1);
-            if self.remaining > 0 {
-                Some(now + self.period)
-            } else {
-                None
-            }
-        }
-    }
-
-    enum MixedLatencyTimer {
-        OneShot,
-        Periodic { period: Duration, remaining: usize },
-    }
-
-    impl Timer for MixedLatencyTimer {
-        type Context = ();
-
-        fn fire(&mut self, now: Instant, _ctx: &mut ()) -> Option<Instant> {
-            match self {
-                MixedLatencyTimer::OneShot => None,
-                MixedLatencyTimer::Periodic { period, remaining } => {
-                    *remaining = remaining.saturating_sub(1);
-                    if *remaining > 0 {
-                        Some(now + *period)
-                    } else {
-                        None
-                    }
-                }
-            }
-        }
+        fn fire(&mut self, _ctx: &mut (), _now: Instant) {}
     }
 
     fn print_histogram(name: &str, hist: &Histogram<u64>) {
@@ -1522,7 +1201,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_insert_latency_standard() {
+    fn hdr_insert_latency() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
@@ -1552,7 +1231,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_cancel_latency_standard() {
+    fn hdr_cancel_latency() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
@@ -1582,7 +1261,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_empty_standard() {
+    fn hdr_poll_empty() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
@@ -1592,7 +1271,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
         }
 
         // Measure
@@ -1600,7 +1279,7 @@ mod latency_tests {
             let now = epoch + Duration::from_millis(i);
 
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1611,7 +1290,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_pending_no_fires_standard() {
+    fn hdr_poll_pending_no_fires() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
@@ -1627,7 +1306,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             let now = epoch + Duration::from_millis(i);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
         }
 
         // Measure
@@ -1635,7 +1314,7 @@ mod latency_tests {
             let now = epoch + Duration::from_millis(i);
 
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1646,7 +1325,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_poll_single_fire_standard() {
+    fn hdr_poll_single_fire() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
@@ -1658,7 +1337,7 @@ mod latency_tests {
             let when = epoch + Duration::from_millis(i + 1);
             let _ = wheel.insert(when, LatencyTimer);
             let now = epoch + Duration::from_millis(i + 1);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
         }
 
         // Measure: insert timer, advance time, poll fires it
@@ -1670,7 +1349,7 @@ mod latency_tests {
             let now = epoch + Duration::from_millis(tick + 1);
 
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
             let elapsed = start.elapsed().as_nanos() as u64;
 
             hist.record(elapsed).unwrap();
@@ -1681,154 +1360,7 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_periodic_steady_state_standard() {
-        let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheel<PeriodicLatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
-
-        let mut hist = Histogram::<u64>::new(3).unwrap();
-        let mut ctx = ();
-
-        // 10 periodic timers, 1ms period (fires every tick)
-        for i in 0..10 {
-            let when = epoch + Duration::from_millis(i + 1);
-            let timer = PeriodicLatencyTimer {
-                period: Duration::from_millis(1),
-                remaining: usize::MAX,
-            };
-            let _ = wheel.insert(when, timer);
-        }
-
-        // Warmup
-        for i in 0..WARMUP {
-            let now = epoch + Duration::from_millis(i + 1);
-            let _ = wheel.poll(now, &mut ctx);
-        }
-
-        // Measure
-        for i in WARMUP..(WARMUP + ITERATIONS) {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
-            let elapsed = start.elapsed().as_nanos() as u64;
-
-            hist.record(elapsed).unwrap();
-        }
-
-        print_histogram("Periodic Steady State (10 timers @ 1ms)", &hist);
-    }
-
-    #[test]
-    #[ignore]
-    fn hdr_mixed_periodic_oneshot_standard() {
-        let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheel<MixedLatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
-
-        let mut hist = Histogram::<u64>::new(3).unwrap();
-        let mut ctx = ();
-
-        // 10 periodic heartbeats, 10ms period
-        for i in 0..10 {
-            let when = epoch + Duration::from_millis(i + 10);
-            let timer = MixedLatencyTimer::Periodic {
-                period: Duration::from_millis(10),
-                remaining: usize::MAX,
-            };
-            let _ = wheel.insert(when, timer);
-        }
-
-        // Warmup
-        for i in 0..WARMUP {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            // Insert 2 one-shot timers per tick (order timeouts)
-            for j in 0..2 {
-                let when = now + Duration::from_millis(50 + (i + j) % 50);
-                let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
-            }
-
-            let _ = wheel.poll(now, &mut ctx);
-        }
-
-        // Measure
-        for i in WARMUP..(WARMUP + ITERATIONS) {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            // Insert 2 one-shot timers per tick
-            for j in 0..2 {
-                let when = now + Duration::from_millis(50 + (i + j) % 50);
-                let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
-            }
-
-            let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
-            let elapsed = start.elapsed().as_nanos() as u64;
-
-            hist.record(elapsed).unwrap();
-        }
-
-        print_histogram("Mixed (10 periodic + 2 oneshot/tick)", &hist);
-    }
-
-    #[test]
-    #[ignore]
-    fn hdr_bursty_workload_standard() {
-        let epoch = Instant::now();
-        let mut wheel: Box<BurstWheel<MixedLatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
-
-        let mut hist = Histogram::<u64>::new(3).unwrap();
-        let mut ctx = ();
-
-        // 10 periodic heartbeats, 10ms period
-        for i in 0..10 {
-            let when = epoch + Duration::from_millis(i + 10);
-            let timer = MixedLatencyTimer::Periodic {
-                period: Duration::from_millis(10),
-                remaining: usize::MAX,
-            };
-            let _ = wheel.insert(when, timer);
-        }
-
-        // Warmup
-        for i in 0..WARMUP {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            // Burst every 100 ticks
-            if i % 100 == 0 {
-                for j in 0..50 {
-                    let when = now + Duration::from_millis(20 + j % 80);
-                    let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
-                }
-            }
-
-            let _ = wheel.poll(now, &mut ctx);
-        }
-
-        // Measure
-        for i in WARMUP..(WARMUP + ITERATIONS) {
-            let now = epoch + Duration::from_millis(i + 1);
-
-            // Burst every 100 ticks
-            if i % 100 == 0 {
-                for j in 0..50 {
-                    let when = now + Duration::from_millis(20 + j % 80);
-                    let _ = wheel.insert(when, MixedLatencyTimer::OneShot);
-                }
-            }
-
-            let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
-            let elapsed = start.elapsed().as_nanos() as u64;
-
-            hist.record(elapsed).unwrap();
-        }
-
-        print_histogram("Bursty (10 periodic + 50 burst every 100ms)", &hist);
-    }
-
-    #[test]
-    #[ignore]
-    fn hdr_trading_simulation_standard() {
+    fn hdr_trading_simulation() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
@@ -1843,7 +1375,7 @@ mod latency_tests {
         // Warmup
         for i in 0..WARMUP {
             now += Duration::from_millis(1);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
 
             if i % 5 != 0 {
                 let when = now + Duration::from_millis(50 + (i % 200));
@@ -1867,7 +1399,7 @@ mod latency_tests {
 
             // Poll
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
             poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
 
             // Insert 80%
@@ -1905,96 +1437,53 @@ mod latency_tests {
 
     #[test]
     #[ignore]
-    fn hdr_realistic_trading_standard() {
+    fn hdr_bursty_workload() {
         let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheel<MixedLatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
+        let mut wheel: Box<BurstWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
-        let mut insert_hist = Histogram::<u64>::new(3).unwrap();
-        let mut poll_hist = Histogram::<u64>::new(3).unwrap();
-        let mut cancel_hist = Histogram::<u64>::new(3).unwrap();
-
-        let mut handles = Vec::with_capacity(100);
+        let mut hist = Histogram::<u64>::new(3).unwrap();
         let mut ctx = ();
-        let mut now = epoch;
-
-        // Background: 5 venue heartbeats @ 30s period
-        for i in 0..5 {
-            let when = epoch + Duration::from_secs(30) + Duration::from_millis(i * 100);
-            let timer = MixedLatencyTimer::Periodic {
-                period: Duration::from_secs(30),
-                remaining: usize::MAX,
-            };
-            let _ = wheel.insert(when, timer);
-        }
 
         // Warmup
         for i in 0..WARMUP {
-            now += Duration::from_millis(1);
-            let _ = wheel.poll(now, &mut ctx);
+            let now = epoch + Duration::from_millis(i + 1);
 
-            // 80% of ticks: new order timeout (50-250ms)
-            if i % 5 != 0 {
-                let when = now + Duration::from_millis(50 + (i % 200));
-                if let Ok(handle) = wheel.insert(when, MixedLatencyTimer::OneShot) {
-                    if handles.len() < 100 {
-                        handles.push(handle);
-                    }
+            // Burst every 100 ticks
+            if i % 100 == 0 {
+                for j in 0..50 {
+                    let when = now + Duration::from_millis(20 + j % 80);
+                    let _ = wheel.insert(when, LatencyTimer);
                 }
             }
 
-            // 5% of ticks: order filled, cancel timeout
-            if i % 20 == 0 {
-                if let Some(handle) = handles.pop() {
-                    let _ = wheel.cancel(handle);
-                }
-            }
+            wheel.poll(&mut ctx, now);
         }
 
         // Measure
-        for i in 0..ITERATIONS {
-            now += Duration::from_millis(1);
+        for i in WARMUP..(WARMUP + ITERATIONS) {
+            let now = epoch + Duration::from_millis(i + 1);
 
-            // Poll (always)
+            // Burst every 100 ticks
+            if i % 100 == 0 {
+                for j in 0..50 {
+                    let when = now + Duration::from_millis(20 + j % 80);
+                    let _ = wheel.insert(when, LatencyTimer);
+                }
+            }
+
             let start = Instant::now();
-            let _ = wheel.poll(now, &mut ctx);
-            poll_hist.record(start.elapsed().as_nanos() as u64).unwrap();
+            wheel.poll(&mut ctx, now);
+            let elapsed = start.elapsed().as_nanos() as u64;
 
-            // Insert order timeout 80%
-            if i % 5 != 0 {
-                let when = now + Duration::from_millis(50 + (i % 200));
-
-                let start = Instant::now();
-                if let Ok(handle) = wheel.insert(when, MixedLatencyTimer::OneShot) {
-                    insert_hist
-                        .record(start.elapsed().as_nanos() as u64)
-                        .unwrap();
-
-                    if handles.len() < 100 {
-                        handles.push(handle);
-                    }
-                }
-            }
-
-            // Cancel 5% (order filled)
-            if i % 20 == 0 {
-                if let Some(handle) = handles.pop() {
-                    let start = Instant::now();
-                    let _ = wheel.cancel(handle);
-                    cancel_hist
-                        .record(start.elapsed().as_nanos() as u64)
-                        .unwrap();
-                }
-            }
+            hist.record(elapsed).unwrap();
         }
 
-        print_histogram("Realistic Trading - Insert (order timeout)", &insert_hist);
-        print_histogram("Realistic Trading - Poll", &poll_hist);
-        print_histogram("Realistic Trading - Cancel (order fill)", &cancel_hist);
+        print_histogram("Bursty (50 burst every 100ms)", &hist);
     }
 
     #[test]
     #[ignore]
-    fn hdr_interleaved_insert_standard() {
+    fn hdr_interleaved_insert() {
         let epoch = Instant::now();
         let mut wheel: Box<BalancedWheel<LatencyTimer>> = BitWheel::boxed_with_epoch(epoch);
 
@@ -2011,7 +1500,7 @@ mod latency_tests {
         // Warmup - insert timers that land BETWEEN existing entries
         for i in 0..WARMUP {
             now += Duration::from_millis(1);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
 
             let base = 100 + ((i % 990) * 10);
             let when = epoch + Duration::from_millis(base + 5);
@@ -2021,7 +1510,7 @@ mod latency_tests {
         // Measure - every insert lands between two existing timers
         for i in 0..ITERATIONS {
             now += Duration::from_millis(1);
-            let _ = wheel.poll(now, &mut ctx);
+            wheel.poll(&mut ctx, now);
 
             // Replenish the "grid" timers as they fire
             if i % 10 == 0 {
