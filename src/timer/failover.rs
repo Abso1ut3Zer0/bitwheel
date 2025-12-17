@@ -1010,7 +1010,7 @@ mod tests {
 
 #[cfg(test)]
 mod latency_tests {
-    use crate::timer::{BalancedWheelWithFailover, BurstWheelWithFailover};
+    use crate::timer::{WheelWithFailover, BurstWheelWithFailover};
 
     use super::*;
     use hdrhistogram::Histogram;
@@ -1045,7 +1045,7 @@ mod latency_tests {
     #[ignore]
     fn hdr_insert_latency() {
         let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
+        let mut wheel: Box<WheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
@@ -1076,7 +1076,7 @@ mod latency_tests {
     #[ignore]
     fn hdr_cancel_latency() {
         let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
+        let mut wheel: Box<WheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
@@ -1107,7 +1107,7 @@ mod latency_tests {
     #[ignore]
     fn hdr_poll_empty() {
         let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
+        let mut wheel: Box<WheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
@@ -1137,7 +1137,7 @@ mod latency_tests {
     #[ignore]
     fn hdr_poll_pending_no_fires() {
         let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
+        let mut wheel: Box<WheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         // Insert timers far in future
@@ -1173,7 +1173,7 @@ mod latency_tests {
     #[ignore]
     fn hdr_poll_single_fire() {
         let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
+        let mut wheel: Box<WheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
@@ -1209,7 +1209,7 @@ mod latency_tests {
     #[ignore]
     fn hdr_trading_simulation() {
         let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
+        let mut wheel: Box<WheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         let mut insert_hist = Histogram::<u64>::new(3).unwrap();
@@ -1332,7 +1332,7 @@ mod latency_tests {
     #[ignore]
     fn hdr_interleaved_insert() {
         let epoch = Instant::now();
-        let mut wheel: Box<BalancedWheelWithFailover<LatencyTimer>> =
+        let mut wheel: Box<WheelWithFailover<LatencyTimer>> =
             BitWheelWithFailover::boxed_with_epoch(epoch);
 
         let mut hist = Histogram::<u64>::new(3).unwrap();
