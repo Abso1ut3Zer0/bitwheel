@@ -83,7 +83,7 @@ where
     /// Infallible poll - reschedule failures go to failover, never lost.
     #[inline(always)]
     fn poll(&mut self, ctx: &mut T::Context, now: Instant) -> usize {
-        Ok(BitWheelWithFailover::poll(self, ctx, now))
+        BitWheelWithFailover::poll(self, ctx, now)
     }
 }
 
