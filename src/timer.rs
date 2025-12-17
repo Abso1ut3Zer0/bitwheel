@@ -80,7 +80,6 @@ where
         BitWheelWithFailover::cancel(self, handle)
     }
 
-    /// Infallible poll - reschedule failures go to failover, never lost.
     #[inline(always)]
     fn poll(&mut self, now: Instant, ctx: &mut T::Context) -> usize {
         BitWheelWithFailover::poll(self, now, ctx)
@@ -120,134 +119,62 @@ pub struct TimerHandle {
 }
 
 // ============================================================
-// BALANCED - General purpose, 4ms resolution, ~19 hour range
+// STANDARD - 256 hotspot, 4ms resolution, ~16 second range
+// Order timeouts, reject backoff, rate limiting
 // ============================================================
 
-/// Standard balanced. 4ms resolution, ~19 hours.
-/// Hotspot: 128. Memory: ~200KB.
-pub type BalancedWheel<T> = BitWheel<T, 4, 4, 16, 8>;
+/// Balanced. 256 hotspot, 4ms, ~16s. ~50KB.
+pub type Wheel<T> = BitWheel<T, 2, 4, 32, 8>;
 
-/// Low latency balanced. 4ms resolution, ~19 hours.
-/// Hotspot: 128. Memory: ~800KB. Minimal probing.
-pub type BalancedFastWheel<T> = BitWheel<T, 4, 4, 64, 2>;
+/// Small memory. 256 hotspot, 4ms, ~16s. ~25KB. More probing.
+pub type SmallWheel<T> = BitWheel<T, 2, 4, 16, 16>;
 
-/// Compact balanced. 4ms resolution, ~19 hours.
-/// Hotspot: 128. Memory: ~100KB. More probing.
-pub type BalancedLightWheel<T> = BitWheel<T, 4, 4, 8, 16>;
+/// Large memory. 256 hotspot, 4ms, ~16s. ~200KB. Tight tails.
+pub type LargeWheel<T> = BitWheel<T, 2, 4, 128, 2>;
 
 // ============================================================
-// PRECISE - Fine timing, 1ms resolution, ~4.7 hour range
+// PRECISE - 256 hotspot, 1ms resolution, ~4 minute range
+// Sub-5ms precision requirements
 // ============================================================
 
-/// Standard precise. 1ms resolution, ~4.7 hours.
-/// Hotspot: 128. Memory: ~200KB.
-pub type PreciseWheel<T> = BitWheel<T, 4, 1, 16, 8>;
+/// Balanced. 256 hotspot, 1ms, ~4min. ~75KB.
+pub type PreciseWheel<T> = BitWheel<T, 3, 1, 32, 8>;
 
-/// Low latency precise. 1ms resolution, ~4.7 hours.
-/// Hotspot: 128. Memory: ~800KB. Minimal probing.
-pub type PreciseFastWheel<T> = BitWheel<T, 4, 1, 64, 2>;
+/// Small memory. 256 hotspot, 1ms, ~4min. ~38KB. More probing.
+pub type SmallPreciseWheel<T> = BitWheel<T, 3, 1, 16, 16>;
 
-/// Compact precise. 1ms resolution, ~4.7 hours.
-/// Hotspot: 128. Memory: ~100KB. More probing.
-pub type PreciseLightWheel<T> = BitWheel<T, 4, 1, 8, 16>;
+/// Large memory. 256 hotspot, 1ms, ~4min. ~300KB. Tight tails.
+pub type LargePreciseWheel<T> = BitWheel<T, 3, 1, 128, 2>;
 
 // ============================================================
-// BURST - High volume, 4ms resolution, ~19 hour range
-// Double hotspot capacity (256) for traffic spikes
+// BURST - 512 hotspot, 4ms resolution, ~16 second range
+// Reject storms, high-frequency order flow
 // ============================================================
 
-/// Standard burst. 4ms resolution, ~19 hours.
-/// Hotspot: 256. Memory: ~400KB.
-pub type BurstWheel<T> = BitWheel<T, 4, 4, 32, 8>;
+/// Balanced. 512 hotspot, 4ms, ~16s. ~100KB.
+pub type BurstWheel<T> = BitWheel<T, 2, 4, 64, 8>;
 
-/// Low latency burst. 4ms resolution, ~19 hours.
-/// Hotspot: 256. Memory: ~1.6MB. Minimal probing.
-pub type BurstFastWheel<T> = BitWheel<T, 4, 4, 128, 2>;
+/// Small memory. 512 hotspot, 4ms, ~16s. ~50KB. More probing.
+pub type SmallBurstWheel<T> = BitWheel<T, 2, 4, 32, 16>;
 
-/// Compact burst. 4ms resolution, ~19 hours.
-/// Hotspot: 256. Memory: ~200KB. More probing.
-pub type BurstLightWheel<T> = BitWheel<T, 4, 4, 16, 16>;
+/// Large memory. 512 hotspot, 4ms, ~16s. ~400KB. Tight tails.
+pub type LargeBurstWheel<T> = BitWheel<T, 2, 4, 256, 2>;
 
 // ============================================================
-// EXTENDED - Long duration, 16ms resolution, ~3 day range
-// For sessions, reconnects, long keepalives
+// WITH FAILOVER - BTreeMap overflow for guaranteed insertion
 // ============================================================
 
-/// Standard extended. 16ms resolution, ~3 days.
-/// Hotspot: 128. Memory: ~200KB.
-pub type ExtendedWheel<T> = BitWheel<T, 4, 16, 16, 8>;
+pub type WheelWithFailover<T> = BitWheelWithFailover<T, 2, 4, 32, 8, 32>;
+pub type SmallWheelWithFailover<T> = BitWheelWithFailover<T, 2, 4, 16, 16, 32>;
+pub type LargeWheelWithFailover<T> = BitWheelWithFailover<T, 2, 4, 128, 2, 32>;
 
-/// Low latency extended. 16ms resolution, ~3 days.
-/// Hotspot: 128. Memory: ~800KB. Minimal probing.
-pub type ExtendedFastWheel<T> = BitWheel<T, 4, 16, 64, 2>;
+pub type PreciseWheelWithFailover<T> = BitWheelWithFailover<T, 3, 1, 32, 8, 32>;
+pub type SmallPreciseWheelWithFailover<T> = BitWheelWithFailover<T, 3, 1, 16, 16, 32>;
+pub type LargePreciseWheelWithFailover<T> = BitWheelWithFailover<T, 3, 1, 128, 2, 32>;
 
-/// Compact extended. 16ms resolution, ~3 days.
-/// Hotspot: 128. Memory: ~100KB. More probing.
-pub type ExtendedLightWheel<T> = BitWheel<T, 4, 16, 8, 16>;
-
-// ============================================================
-// BALANCED WITH FAILOVER - General purpose, 4ms resolution
-// ============================================================
-
-/// Standard balanced with failover. 4ms resolution, ~19 hours.
-/// Hotspot: 128. Memory: ~200KB. Failover check: 128ms.
-pub type BalancedWheelWithFailover<T> = BitWheelWithFailover<T, 4, 4, 16, 8, 32>;
-
-/// Low latency balanced with failover. 4ms resolution, ~19 hours.
-/// Hotspot: 128. Memory: ~800KB. Failover check: 128ms.
-pub type BalancedFastWheelWithFailover<T> = BitWheelWithFailover<T, 4, 4, 64, 2, 32>;
-
-/// Compact balanced with failover. 4ms resolution, ~19 hours.
-/// Hotspot: 128. Memory: ~100KB. Failover check: 128ms.
-pub type BalancedLightWheelWithFailover<T> = BitWheelWithFailover<T, 4, 4, 8, 16, 32>;
-
-// ============================================================
-// PRECISE WITH FAILOVER - Fine timing, 1ms resolution
-// ============================================================
-
-/// Standard precise with failover. 1ms resolution, ~4.7 hours.
-/// Hotspot: 128. Memory: ~200KB. Failover check: 32ms.
-pub type PreciseWheelWithFailover<T> = BitWheelWithFailover<T, 4, 1, 16, 8, 32>;
-
-/// Low latency precise with failover. 1ms resolution, ~4.7 hours.
-/// Hotspot: 128. Memory: ~800KB. Failover check: 32ms.
-pub type PreciseFastWheelWithFailover<T> = BitWheelWithFailover<T, 4, 1, 64, 2, 32>;
-
-/// Compact precise with failover. 1ms resolution, ~4.7 hours.
-/// Hotspot: 128. Memory: ~100KB. Failover check: 32ms.
-pub type PreciseLightWheelWithFailover<T> = BitWheelWithFailover<T, 4, 1, 8, 16, 32>;
-
-// ============================================================
-// BURST WITH FAILOVER - High volume, 4ms resolution
-// ============================================================
-
-/// Standard burst with failover. 4ms resolution, ~19 hours.
-/// Hotspot: 256. Memory: ~400KB. Failover check: 128ms.
-pub type BurstWheelWithFailover<T> = BitWheelWithFailover<T, 4, 4, 32, 8, 32>;
-
-/// Low latency burst with failover. 4ms resolution, ~19 hours.
-/// Hotspot: 256. Memory: ~1.6MB. Failover check: 128ms.
-pub type BurstFastWheelWithFailover<T> = BitWheelWithFailover<T, 4, 4, 128, 2, 32>;
-
-/// Compact burst with failover. 4ms resolution, ~19 hours.
-/// Hotspot: 256. Memory: ~200KB. Failover check: 128ms.
-pub type BurstLightWheelWithFailover<T> = BitWheelWithFailover<T, 4, 4, 16, 16, 32>;
-
-// ============================================================
-// EXTENDED WITH FAILOVER - Long duration, 16ms resolution
-// ============================================================
-
-/// Standard extended with failover. 16ms resolution, ~3 days.
-/// Hotspot: 128. Memory: ~200KB. Failover check: 512ms.
-pub type ExtendedWheelWithFailover<T> = BitWheelWithFailover<T, 4, 16, 16, 8, 32>;
-
-/// Low latency extended with failover. 16ms resolution, ~3 days.
-/// Hotspot: 128. Memory: ~800KB. Failover check: 512ms.
-pub type ExtendedFastWheelWithFailover<T> = BitWheelWithFailover<T, 4, 16, 64, 2, 32>;
-
-/// Compact extended with failover. 16ms resolution, ~3 days.
-/// Hotspot: 128. Memory: ~100KB. Failover check: 512ms.
-pub type ExtendedLightWheelWithFailover<T> = BitWheelWithFailover<T, 4, 16, 8, 16, 32>;
+pub type BurstWheelWithFailover<T> = BitWheelWithFailover<T, 2, 4, 64, 8, 32>;
+pub type SmallBurstWheelWithFailover<T> = BitWheelWithFailover<T, 2, 4, 32, 16, 32>;
+pub type LargeBurstWheelWithFailover<T> = BitWheelWithFailover<T, 2, 4, 256, 2, 32>;
 
 #[macro_export]
 macro_rules! define_bitwheel {
