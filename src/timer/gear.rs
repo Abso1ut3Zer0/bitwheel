@@ -12,12 +12,12 @@ pub const SLOT_MASK: usize = 63;
 pub struct NoAvailableSlot;
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("wheel capacity exceeded")]
+#[error("could not insert into wheel")]
 pub struct InsertError<T>(pub T);
 
 impl<T> Debug for InsertError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("wheel capacity exceeded")
+        f.write_str("could not insert into wheel")
     }
 }
 
