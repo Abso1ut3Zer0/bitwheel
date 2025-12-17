@@ -6,7 +6,7 @@ use crate::timer::{
 };
 
 pub const DEFAULT_GEARS: usize = 5;
-pub const DEFAULT_RESOLUTION_MS: u64 = 5;
+pub const DEFAULT_RESOLUTION_MS: u64 = 4;
 pub const DEFAULT_SLOT_CAP: usize = 32;
 pub const DEFAULT_MAX_PROBES: usize = 3;
 
@@ -48,11 +48,17 @@ impl<
     const MAX_PROBES: usize,
 > BitWheel<T, NUM_GEARS, RESOLUTION_MS, SLOT_CAP, MAX_PROBES>
 {
+    const RESOLUTION_SHIFT: u32 = RESOLUTION_MS.trailing_zeros();
+
     pub fn with_epoch(epoch: Instant) -> Self {
         const {
             assert!(NUM_GEARS >= 1, "must have at least one gear");
             assert!(NUM_GEARS <= 64, "cannot have more than 64 gears");
             assert!(RESOLUTION_MS >= 1, "resolution must be at least 1ms");
+            assert!(
+                RESOLUTION_MS.is_power_of_two(),
+                "resolution must be a power of 2"
+            );
             assert!(
                 6 * NUM_GEARS + (64 - RESOLUTION_MS.leading_zeros() as usize) <= 64,
                 "configuration would overflow u64 - reduce NUM_GEARS or RESOLUTION_MS"
@@ -334,7 +340,7 @@ impl<
 
     #[inline(always)]
     pub(crate) fn instant_to_tick(&self, when: Instant) -> u64 {
-        when.saturating_duration_since(self.epoch).as_millis() as u64 / RESOLUTION_MS
+        when.saturating_duration_since(self.epoch).as_millis() as u64 >> Self::RESOLUTION_SHIFT
     }
 
     #[inline(always)]
@@ -347,6 +353,7 @@ impl<
         if delay == 0 {
             return 0;
         }
+
         let gear = (63 - delay.leading_zeros()) as usize / 6;
         gear.min(NUM_GEARS - 1)
     }
@@ -431,7 +438,7 @@ mod tests {
     #[test]
     fn test_custom_config() {
         // 4 gears, 10ms resolution, 16 slots, 5 max probes
-        let wheel: Box<BitWheel<OneShotTimer, 4, 10, 16, 5>> = BitWheel::boxed();
+        let wheel: Box<BitWheel<OneShotTimer, 4, 8, 16, 5>> = BitWheel::boxed();
         assert!(wheel.is_empty());
     }
 
