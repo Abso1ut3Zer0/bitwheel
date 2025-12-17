@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::{
+use crate::timer::{
     BitWheel, PollError, Timer, TimerHandle,
     gear::{InsertError, NUM_SLOTS},
 };
@@ -284,7 +284,7 @@ pub struct OneshotCapacityInfo {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
+    use crate::timer::{
         FastPreciseFastDualWheel, StandardBalancedDualWheel, StandardBalancedLightDualWheel,
         StandardBurstDualWheel,
     };
@@ -878,7 +878,7 @@ mod tests {
 
 #[cfg(test)]
 mod latency_tests {
-    use crate::{DualBitWheel, StandardBalancedDualWheel, StandardBurstDualWheel, Timer};
+    use crate::timer::{DualBitWheel, StandardBalancedDualWheel, StandardBurstDualWheel, Timer};
 
     use hdrhistogram::Histogram;
     use std::time::{Duration, Instant};
@@ -1586,8 +1586,8 @@ mod latency_tests {
             DualBitWheel::boxed_with_epoch(epoch);
 
         // Setup single wheel (using the oneshot config which is BalancedWheel)
-        let mut single: Box<crate::BalancedWheel<LatencyTimer>> =
-            crate::BitWheel::boxed_with_epoch(epoch);
+        let mut single: Box<crate::timer::BalancedWheel<LatencyTimer>> =
+            crate::timer::BitWheel::boxed_with_epoch(epoch);
 
         // Add background timers to both - far in future so they don't fire
         for i in 0..100 {
@@ -1678,8 +1678,8 @@ mod latency_tests {
 
         // Test single wheel
         {
-            let mut single: Box<crate::BalancedWheel<LatencyTimer>> =
-                crate::BitWheel::boxed_with_epoch(epoch);
+            let mut single: Box<crate::timer::BalancedWheel<LatencyTimer>> =
+                crate::timer::BitWheel::boxed_with_epoch(epoch);
 
             // Warmup
             for i in 0..WARMUP {

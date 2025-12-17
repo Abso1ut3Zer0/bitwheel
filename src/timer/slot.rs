@@ -1,4 +1,4 @@
-use crate::DEFAULT_SLOT_CAP;
+use crate::timer::DEFAULT_SLOT_CAP;
 
 const NONE: usize = usize::MAX;
 

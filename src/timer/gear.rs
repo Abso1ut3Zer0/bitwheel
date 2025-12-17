@@ -1,4 +1,4 @@
-use crate::{DEFAULT_SLOT_CAP, slot::Slot};
+use crate::timer::{DEFAULT_SLOT_CAP, slot::Slot};
 use std::{
     cell::{Cell, UnsafeCell},
     fmt::Debug,

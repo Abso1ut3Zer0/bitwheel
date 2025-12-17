@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::{
+use crate::timer::{
     PollError, Timer, TimerHandle,
     gear::{Gear, InsertError, NUM_SLOTS, SLOT_MASK},
 };
@@ -1446,7 +1446,7 @@ mod tests {
 
 #[cfg(test)]
 mod latency_tests {
-    use crate::{BalancedWheel, BurstWheel};
+    use crate::timer::{BalancedWheel, BurstWheel};
 
     use super::*;
     use hdrhistogram::Histogram;

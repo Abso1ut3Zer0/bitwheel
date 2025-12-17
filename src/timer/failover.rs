@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{
+use crate::timer::{
     BitWheel, DEFAULT_GEARS, DEFAULT_MAX_PROBES, DEFAULT_RESOLUTION_MS, DEFAULT_SLOT_CAP, Timer,
     TimerHandle, gear::InsertError,
 };
@@ -939,7 +939,7 @@ mod tests {
 
 #[cfg(test)]
 mod latency_tests {
-    use crate::{BalancedWheelWithFailover, BurstWheelWithFailover};
+    use crate::timer::{BalancedWheelWithFailover, BurstWheelWithFailover};
 
     use super::*;
     use hdrhistogram::Histogram;
