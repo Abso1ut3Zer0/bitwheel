@@ -25,7 +25,7 @@ impl<T> Debug for InsertError<T> {
 pub trait Interval {
     type Context;
 
-    fn fire(&mut self, ctx: &mut Self::Context);
+    fn fire(&mut self, ctx: &mut Self::Context) -> bool;
 
     fn period(&self) -> Duration;
 }
@@ -230,13 +230,30 @@ mod heap {
                 }
 
                 let entry = unsafe { self.entries[entry_idx].assume_init_mut() };
-                entry.interval.fire(ctx);
+                let should_continue = entry.interval.fire(ctx);
                 fired += 1;
 
-                let period = entry.interval.period().max(MIN_PERIOD);
-                entry.fire_at = now + period;
+                if should_continue {
+                    // Reschedule
+                    let period = entry.interval.period().max(MIN_PERIOD);
+                    entry.fire_at = now + period;
+                    self.sink(0);
+                } else {
+                    // Remove from heap - swap root with last, then sink
+                    self.heap_len -= 1;
 
-                self.sink(0);
+                    if self.heap_len > 0 {
+                        self.heap[0] = self.heap[self.heap_len as usize];
+                        self.heap_pos[self.heap[0] as usize] = 0;
+                        self.sink(0);
+                    }
+
+                    // Mark as inactive and return to free list
+                    self.heap_pos[entry_idx] = NONE;
+                    unsafe { self.entries[entry_idx].assume_init_drop() };
+                    self.free_stack[self.free_len as usize] = entry_idx as u16;
+                    self.free_len += 1;
+                }
             }
 
             fired
@@ -305,9 +322,10 @@ mod tests {
     impl Interval for SimpleInterval {
         type Context = Vec<usize>;
 
-        fn fire(&mut self, ctx: &mut Self::Context) {
+        fn fire(&mut self, ctx: &mut Self::Context) -> bool {
             self.fire_count.set(self.fire_count.get() + 1);
             ctx.push(self.id);
+            true
         }
 
         fn period(&self) -> Duration {
@@ -330,8 +348,9 @@ mod tests {
     impl Interval for CounterInterval {
         type Context = usize;
 
-        fn fire(&mut self, ctx: &mut Self::Context) {
+        fn fire(&mut self, ctx: &mut Self::Context) -> bool {
             *ctx += 1;
+            true
         }
 
         fn period(&self) -> Duration {
@@ -714,7 +733,10 @@ mod tests {
 
         impl Interval for DropInterval {
             type Context = ();
-            fn fire(&mut self, _ctx: &mut Self::Context) {}
+            fn fire(&mut self, _ctx: &mut Self::Context) -> bool {
+                true
+            }
+
             fn period(&self) -> Duration {
                 Duration::from_millis(100)
             }
@@ -768,7 +790,10 @@ mod tests {
 
         impl Interval for DropInterval {
             type Context = ();
-            fn fire(&mut self, _ctx: &mut Self::Context) {}
+            fn fire(&mut self, _ctx: &mut Self::Context) -> bool {
+                true
+            }
+
             fn period(&self) -> Duration {
                 Duration::from_millis(100)
             }
@@ -927,6 +952,228 @@ mod tests {
         // 50ms interval: 2 fires (at 50, 100)
         assert_eq!(ctx, 10 + 3 + 2);
     }
+
+    // ==================== Conditional Removal via fire() return ====================
+
+    struct LimitedInterval {
+        id: usize,
+        period: Duration,
+        max_fires: usize,
+        fire_count: usize,
+    }
+
+    impl LimitedInterval {
+        fn new(id: usize, period_ms: u64, max_fires: usize) -> Self {
+            Self {
+                id,
+                period: Duration::from_millis(period_ms),
+                max_fires,
+                fire_count: 0,
+            }
+        }
+    }
+
+    impl Interval for LimitedInterval {
+        type Context = Vec<usize>;
+
+        fn fire(&mut self, ctx: &mut Self::Context) -> bool {
+            self.fire_count += 1;
+            ctx.push(self.id);
+            self.fire_count < self.max_fires
+        }
+
+        fn period(&self) -> Duration {
+            self.period
+        }
+    }
+
+    #[test]
+    fn test_fire_returns_false_removes_interval() {
+        struct OneShotInterval(usize);
+
+        impl Interval for OneShotInterval {
+            type Context = Vec<usize>;
+
+            fn fire(&mut self, ctx: &mut Self::Context) -> bool {
+                ctx.push(self.0);
+                false // Don't reschedule
+            }
+
+            fn period(&self) -> Duration {
+                Duration::from_millis(100)
+            }
+        }
+
+        let mut heap: IntervalHeap<OneShotInterval, 4> = IntervalHeap::new();
+        let now = Instant::now();
+
+        let handle = heap.insert(now, OneShotInterval(42)).unwrap();
+        assert_eq!(heap.len(), 1);
+
+        let mut ctx = Vec::new();
+        let fired = heap.poll(now + Duration::from_millis(100), &mut ctx);
+
+        assert_eq!(fired, 1);
+        assert_eq!(ctx, vec![42]);
+        assert!(heap.is_empty());
+        assert!(!heap.is_active(handle));
+    }
+
+    #[test]
+    fn test_limited_fires_then_removed() {
+        let mut heap: IntervalHeap<LimitedInterval, 4> = IntervalHeap::new();
+        let now = Instant::now();
+
+        // Fire 3 times then stop
+        let handle = heap.insert(now, LimitedInterval::new(1, 50, 3)).unwrap();
+
+        let mut ctx = Vec::new();
+
+        // Fire 1
+        heap.poll(now + Duration::from_millis(50), &mut ctx);
+        assert_eq!(ctx.len(), 1);
+        assert!(heap.is_active(handle));
+
+        // Fire 2
+        heap.poll(now + Duration::from_millis(100), &mut ctx);
+        assert_eq!(ctx.len(), 2);
+        assert!(heap.is_active(handle));
+
+        // Fire 3 - should be removed after
+        heap.poll(now + Duration::from_millis(150), &mut ctx);
+        assert_eq!(ctx.len(), 3);
+        assert!(!heap.is_active(handle));
+        assert!(heap.is_empty());
+
+        // No more fires
+        heap.poll(now + Duration::from_millis(200), &mut ctx);
+        assert_eq!(ctx.len(), 3);
+    }
+
+    #[test]
+    fn test_mixed_continuing_and_stopping() {
+        struct MaybeStopInterval {
+            id: usize,
+            period: Duration,
+            stop_after: usize,
+            fire_count: usize,
+        }
+
+        impl Interval for MaybeStopInterval {
+            type Context = Vec<usize>;
+
+            fn fire(&mut self, ctx: &mut Self::Context) -> bool {
+                self.fire_count += 1;
+                ctx.push(self.id);
+                self.fire_count < self.stop_after
+            }
+
+            fn period(&self) -> Duration {
+                self.period
+            }
+        }
+
+        let mut heap: IntervalHeap<MaybeStopInterval, 4> = IntervalHeap::new();
+        let now = Instant::now();
+
+        // Interval 1: stops after 1 fire
+        heap.insert(
+            now,
+            MaybeStopInterval {
+                id: 1,
+                period: Duration::from_millis(50),
+                stop_after: 1,
+                fire_count: 0,
+            },
+        )
+        .unwrap();
+
+        // Interval 2: stops after 3 fires
+        heap.insert(
+            now,
+            MaybeStopInterval {
+                id: 2,
+                period: Duration::from_millis(50),
+                stop_after: 3,
+                fire_count: 0,
+            },
+        )
+        .unwrap();
+
+        // Interval 3: never stops (large limit)
+        heap.insert(
+            now,
+            MaybeStopInterval {
+                id: 3,
+                period: Duration::from_millis(50),
+                stop_after: 1000,
+                fire_count: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(heap.len(), 3);
+
+        let mut ctx = Vec::new();
+
+        // At 50ms: all three fire, interval 1 removed
+        heap.poll(now + Duration::from_millis(50), &mut ctx);
+        assert_eq!(heap.len(), 2);
+
+        // At 100ms: intervals 2 and 3 fire
+        heap.poll(now + Duration::from_millis(100), &mut ctx);
+        assert_eq!(heap.len(), 2);
+
+        // At 150ms: intervals 2 and 3 fire, interval 2 removed
+        heap.poll(now + Duration::from_millis(150), &mut ctx);
+        assert_eq!(heap.len(), 1);
+
+        // At 200ms: only interval 3 fires
+        heap.poll(now + Duration::from_millis(200), &mut ctx);
+        assert_eq!(heap.len(), 1);
+
+        // Count fires per interval
+        assert_eq!(ctx.iter().filter(|&&x| x == 1).count(), 1);
+        assert_eq!(ctx.iter().filter(|&&x| x == 2).count(), 3);
+        assert_eq!(ctx.iter().filter(|&&x| x == 3).count(), 4);
+    }
+
+    #[test]
+    fn test_slot_reused_after_fire_removal() {
+        struct OneShotInterval(usize);
+
+        impl Interval for OneShotInterval {
+            type Context = Vec<usize>;
+
+            fn fire(&mut self, ctx: &mut Self::Context) -> bool {
+                ctx.push(self.0);
+                false
+            }
+
+            fn period(&self) -> Duration {
+                Duration::from_millis(50)
+            }
+        }
+
+        let mut heap: IntervalHeap<OneShotInterval, 2> = IntervalHeap::new();
+        let now = Instant::now();
+
+        // Fill to capacity
+        heap.insert(now, OneShotInterval(1)).unwrap();
+        heap.insert(now, OneShotInterval(2)).unwrap();
+        assert!(heap.insert(now, OneShotInterval(3)).is_err());
+
+        // Fire both - they return false so both removed
+        let mut ctx = Vec::new();
+        heap.poll(now + Duration::from_millis(50), &mut ctx);
+        assert_eq!(ctx.len(), 2);
+        assert!(heap.is_empty());
+
+        // Slots freed - can insert again
+        heap.insert(now, OneShotInterval(4)).unwrap();
+        heap.insert(now, OneShotInterval(5)).unwrap();
+        assert_eq!(heap.len(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -955,7 +1202,9 @@ mod latency_tests {
     impl Interval for BenchInterval {
         type Context = ();
 
-        fn fire(&mut self, _ctx: &mut Self::Context) {}
+        fn fire(&mut self, _ctx: &mut Self::Context) -> bool {
+            true
+        }
 
         fn period(&self) -> Duration {
             self.period

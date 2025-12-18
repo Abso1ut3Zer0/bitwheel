@@ -4,7 +4,7 @@ High-performance timer primitives for Rust, optimized for consistent low-latency
 
 ## Two Data Structures, Two Use Cases
 
-| | BitWheel | TickerHeap |
+| | BitWheel | IntervalHeap |
 |--|----------|------------|
 | **Purpose** | High-throughput ephemeral timers | Cancellable periodic tickers |
 | **Examples** | Order timeouts, rate limits, retries | Heartbeats, monitoring sweeps, metrics flush |
@@ -14,7 +14,7 @@ High-performance timer primitives for Rust, optimized for consistent low-latency
 
 **Use BitWheel when**: You need maximum throughput for short-lived timers that fire once and disappear.
 
-**Use TickerHeap when**: You need periodic callbacks with stable handles for cancellation.
+**Use IntervalHeap when**: You need periodic callbacks with stable handles for cancellation.
 
 ## Quick Start
 
@@ -53,13 +53,13 @@ fn main() {
 }
 ```
 
-### TickerHeap — Periodic Tickers
+### IntervalHeap — Periodic Intervals
 ```rust
-use bitwheel::TickerHeap;
+use bitwheel::IntervalHeap;
 use std::time::{Duration, Instant};
 
 fn main() {
-    let mut tickers: TickerHeap<(), 32> = TickerHeap::new();
+    let mut tickers: IntervalHeap<(), 32> = IntervalHeap::new();
     
     // Register a heartbeat ticker
     let handle = tickers.insert(
@@ -217,7 +217,7 @@ Each gear has 64 slots. When a slot fills to `SLOT_CAP`, inserts probe linearly 
 
 ---
 
-## TickerHeap
+## IntervalHeap
 
 A min-heap for low-volume periodic tickers with stable handles.
 
@@ -227,16 +227,16 @@ A min-heap for low-volume periodic tickers with stable handles.
 - **O(log n) insert/remove** — Heap operations scale logarithmically  
 - **O(1) poll** — Peek at min is constant time; fires are O(log n) each
 - **Zero allocation** — Fixed-capacity array, no heap alloc on hot path
-- **Automatic rescheduling** — Tickers reschedule themselves after firing
+- **Automatic rescheduling** — Intervals reschedule themselves after firing
 - **Configurable capacity** — Const generic for compile-time sizing
 
 ### API
 ```rust
-use bitwheel::TickerHeap;
+use bitwheel::IntervalHeap;
 use std::time::{Duration, Instant};
 
 // Create with capacity for 32 tickers
-let mut heap: TickerHeap<MyContext, 32> = TickerHeap::new();
+let mut heap: IntervalHeap<MyContext, 32> = IntervalHeap::new();
 
 // Insert a ticker (period, first fire time, callback)
 let handle = heap.insert(
@@ -259,7 +259,7 @@ heap.len();                  // Number of active tickers
 
 ### Typical Use Cases
 
-| Ticker | Period | Example |
+| Interval | Period | Example |
 |--------|--------|---------|
 | Venue heartbeat | 30s | Exchange liveness check |
 | Position sweep | 1s | Reconciliation scan |
@@ -269,7 +269,7 @@ heap.len();                  // Number of active tickers
 
 ### Capacity Guidelines
 
-TickerHeap is designed for small n (tens to low hundreds). For a trading system:
+IntervalHeap is designed for small n (tens to low hundreds). For a trading system:
 
 ```rust
 // Typical ticker inventory:
@@ -280,7 +280,7 @@ TickerHeap is designed for small n (tens to low hundreds). For a trading system:
 // - ~10 spare
 // Total: ~20 tickers
 
-type TradingTickers<Ctx> = TickerHeap<Ctx, 32>;  // Comfortable headroom
+type TradingIntervals<Ctx> = IntervalHeap<Ctx, 32>;  // Comfortable headroom
 ```
 
 ---
@@ -316,7 +316,7 @@ Timers inserted between existing entries — stresses tree rebalancing.
 | p99.9 | **48 ns** | 75 ns | 131 ns | 990 ns |
 | p99.99 | **131 ns** | 149 ns | 201 ns | 2415 ns |
 
-### TickerHeap — Periodic Ticker Performance
+### IntervalHeap — Periodic Interval Performance
 
 #### Heartbeat Scenario (5 venue heartbeats, continuous operation)
 
@@ -343,12 +343,12 @@ Comparisons:
 
 ## Event Loop Integration
 ```rust
-use bitwheel::{BitWheel, BalancedWheel, TickerHeap, Timer};
+use bitwheel::{BitWheel, BalancedWheel, IntervalHeap, Timer};
 use std::time::{Duration, Instant};
 
 struct TimerSystem<T: Timer> {
     wheel: Box<BalancedWheel<T>>,
-    tickers: TickerHeap<T::Context, 32>,
+    tickers: IntervalHeap<T::Context, 32>,
 }
 
 impl<T: Timer> TimerSystem<T> {
